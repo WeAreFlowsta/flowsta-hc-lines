@@ -15,6 +15,20 @@
 //! re-exports below rather than declaring them yourself: two declarations
 //! of one crate at different versions cannot resolve.
 
+mod error;
+mod line;
+mod record;
+mod versions;
+
+pub use error::{Error, Result};
+pub use line::{needs_update, records_held, Line};
+pub use record::{record, record_opt, records, RecordView};
+#[cfg(feature = "line-06")]
+pub use record::view_06;
+#[cfg(feature = "line-07")]
+pub use record::view_07;
+pub use versions::{latest_versions, missing_on, Versioned};
+
 /// The Holochain 0.6 line: conductor 0.6.1, lair 0.6.3.
 #[cfg(feature = "line-06")]
 pub mod v06 {

@@ -25,17 +25,6 @@ Each line is a Cargo feature that pins the exact client crate versions its condu
 
 Use those crates through the library's re-exports (`flowsta_hc_lines::v06::holochain_client`, `flowsta_hc_lines::v07::lair_keystore_api`, ...) rather than declaring them in your own `Cargo.toml`: two declarations of one crate at different versions cannot resolve. An app compiles at most two lines, the current one and the one before it.
 
-## The core2 patch
-
-`core2` 0.4.0, a dependency of the lair crates, was yanked from crates.io and its source repository archived, so a fresh dependency resolve fails without help. This repository vendors the crate. A `[patch]` does not carry through a dependency, so add the same patch to your app's `Cargo.toml`:
-
-```toml
-[patch.crates-io]
-core2 = { git = "https://github.com/WeAreFlowsta/flowsta-hc-lines" }
-```
-
-Pin it with `tag = "..."` to the release of this library you depend on.
-
 ## Toolchain
 
 The 0.7 client crates need Rust 1.93 or later; this repository pins 1.99.1 in `rust-toolchain.toml`.
