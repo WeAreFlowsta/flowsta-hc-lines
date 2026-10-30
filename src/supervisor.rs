@@ -158,7 +158,7 @@ macro_rules! ensure_agents {
     }};
 }
 
-async fn agents_on(url: &str, s: &LineStart<'_>, lair: &mut SidecarChild, on_step: &mut dyn FnMut(StartStep)) -> Result<Vec<[u8; 32]>> {
+async fn agents_on(url: &str, s: &LineStart<'_>, lair: &mut SidecarChild, on_step: &mut (dyn FnMut(StartStep) + Send)) -> Result<Vec<[u8; 32]>> {
     match s.line {
         #[cfg(feature = "line-06")]
         Line::V06 => ensure_agents!(v06, url, s, lair, on_step),
@@ -172,7 +172,7 @@ async fn agents_on(url: &str, s: &LineStart<'_>, lair: &mut SidecarChild, on_ste
 /// Start one line: the key store (created on first run), the agents, a free
 /// admin port, the config, the conductor, its admin interface. `on_step` is
 /// called as each step begins. On any failure what was started is stopped.
-pub async fn start_line(s: &LineStart<'_>, mut on_step: impl FnMut(StartStep)) -> Result<LineProcess> {
+pub async fn start_line(s: &LineStart<'_>, mut on_step: impl FnMut(StartStep) + Send) -> Result<LineProcess> {
     on_step(StartStep::KeyStore);
     let (mut lair, url) = keystore::start(s.lair_dir, s.lair_bin, s.passphrase, s.sockets)?;
     let lair_up = async {
@@ -230,6 +230,13 @@ pub async fn start_line(s: &LineStart<'_>, mut on_step: impl FnMut(StartStep)) -
         conductor_dir: s.conductor_dir.to_path_buf(),
         timeouts: s.timeouts,
     })
+}
+
+/// A start runs on a multi-threaded runtime: its future must be `Send`.
+#[allow(dead_code)]
+fn start_line_is_send(s: &'static LineStart<'static>) {
+    fn send<T: Send>(_: T) {}
+    send(start_line(s, |_| {}));
 }
 
 #[cfg(all(test, feature = "line-06", feature = "line-07"))]

@@ -166,7 +166,21 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(200));
             reaped = reap_orphaned_sidecars(&[name.as_str()]);
         }
-        assert!(reaped >= 1, "the parentless one is stopped ({} reaped)", reaped);
+        if reaped == 0 {
+            // Say what the scan saw, so a failure on another machine explains itself.
+            use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
+            let sys = System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_exe(UpdateKind::Always)));
+            let seen: Vec<String> = sys
+                .processes()
+                .iter()
+                .filter(|(_, p)| p.name().to_string_lossy().starts_with("hclines-test") || p.exe().map(|e| e.ends_with(&name)).unwrap_or(false))
+                .map(|(pid, p)| {
+                    let parent = p.parent().and_then(|pp| sys.process(pp).map(|q| format!("{pp} {:?} exe {:?}", q.name(), q.exe())));
+                    format!("pid {pid} name {:?} exe {:?} thread {:?} parent {:?}", p.name(), p.exe(), p.thread_kind(), parent)
+                })
+                .collect();
+            panic!("the parentless one is stopped (0 reaped); me {} exe {:?}; seen: {:#?}", std::process::id(), std::env::current_exe().ok(), seen);
+        }
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(mine.try_wait().unwrap().is_none(), "our own child is kept");
         let _ = mine.kill();
