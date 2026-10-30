@@ -13,3 +13,11 @@ pub enum Error {
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
+
+/// For apps whose functions still return `Result<_, String>`: `?` keeps
+/// working on this library's results while they move to the typed error.
+impl From<Error> for String {
+    fn from(e: Error) -> String {
+        e.to_string()
+    }
+}
