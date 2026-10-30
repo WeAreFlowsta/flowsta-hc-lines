@@ -78,14 +78,17 @@ impl CommandExt for Command {
     }
 }
 
-/// A sidecar spawn: program + args + working dir, stdin always piped (the
-/// passphrase goes down it), stdout/stderr to the given files or discarded.
+/// A sidecar spawn: program + args + working dir + environment additions,
+/// stdin always piped (the passphrase goes down it), stdout/stderr to the
+/// given files or discarded. The child inherits this process's environment
+/// with `env` additions on top; this process's own is never changed.
 /// `spawn` yields a [`SidecarChild`] with the same small surface on every
 /// platform: `stdin`, `id`, `try_wait`, `wait`, `kill`.
 pub struct SidecarCommand {
     program: PathBuf,
     args: Vec<OsString>,
     cwd: Option<PathBuf>,
+    envs: Vec<(OsString, OsString)>,
     stdout: Option<File>,
     stderr: Option<File>,
 }
@@ -96,6 +99,7 @@ impl SidecarCommand {
             program: program.into(),
             args: Vec::new(),
             cwd: None,
+            envs: Vec::new(),
             stdout: None,
             stderr: None,
         }
@@ -108,6 +112,12 @@ impl SidecarCommand {
 
     pub fn current_dir(mut self, d: impl Into<PathBuf>) -> Self {
         self.cwd = Some(d.into());
+        self
+    }
+
+    /// Set `key` for the child only.
+    pub fn env(mut self, key: impl Into<OsString>, value: impl Into<OsString>) -> Self {
+        self.envs.push((key.into(), value.into()));
         self
     }
 
@@ -128,6 +138,7 @@ impl SidecarCommand {
         use std::process::Stdio;
         let mut cmd = Command::new(&self.program);
         cmd.args(&self.args)
+            .envs(self.envs.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(self.stdout.map(Stdio::from).unwrap_or_else(Stdio::null))
             .stderr(self.stderr.map(Stdio::from).unwrap_or_else(Stdio::null));
@@ -307,8 +318,8 @@ mod win_spawn {
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, GetCurrentProcess, GetExitCodeProcess, TerminateProcess,
-        WaitForSingleObject, INFINITE, PROCESS_INFORMATION, STARTF_USESHOWWINDOW,
-        STARTF_USESTDHANDLES, STARTUPINFOW,
+        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
+        STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
@@ -399,6 +410,28 @@ mod win_spawn {
         s.encode_wide().chain(std::iter::once(0)).collect()
     }
 
+    /// This process's environment with `extra` on top, as the UTF-16 block
+    /// CreateProcessW takes: `NAME=value\0` per variable, sorted by name
+    /// without regard to case (as Windows requires), ending in an extra `\0`.
+    fn environment_block(extra: &[(std::ffi::OsString, std::ffi::OsString)]) -> Vec<u16> {
+        let upper = |k: &std::ffi::OsStr| k.to_string_lossy().to_uppercase();
+        let mut vars: Vec<(std::ffi::OsString, std::ffi::OsString)> = std::env::vars_os().collect();
+        for (k, v) in extra {
+            vars.retain(|(have, _)| upper(have) != upper(k));
+            vars.push((k.clone(), v.clone()));
+        }
+        vars.sort_by_key(|(k, _)| upper(k));
+        let mut block = Vec::new();
+        for (k, v) in &vars {
+            block.extend(k.encode_wide());
+            block.push(b'=' as u16);
+            block.extend(v.encode_wide());
+            block.push(0);
+        }
+        block.push(0);
+        block
+    }
+
     /// An inheritable duplicate of `h` (the child gets the copy; the
     /// original stays ours and non-inheritable).
     fn inheritable_dup(h: HANDLE) -> io::Result<HANDLE> {
@@ -476,6 +509,8 @@ mod win_spawn {
         let mut line_w = wide(std::ffi::OsStr::new(&line));
         let program_w = wide(cmd.program.as_os_str());
         let cwd_w = cmd.cwd.as_ref().map(|d| wide(d.as_os_str()));
+        // Inherit the environment as it is unless the command adds to it.
+        let env_block = (!cmd.envs.is_empty()).then(|| environment_block(&cmd.envs));
 
         let mut si: STARTUPINFOW = unsafe { std::mem::zeroed() };
         si.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -495,8 +530,10 @@ mod win_spawn {
                 std::ptr::null(),
                 std::ptr::null(),
                 1, // bInheritHandles: the three std handles above
-                0, // no creation flags: a normal console, created hidden via si
-                std::ptr::null(),
+                // A normal console, created hidden via si; a UTF-16 block
+                // when the environment is given.
+                if env_block.is_some() { CREATE_UNICODE_ENVIRONMENT } else { 0 },
+                env_block.as_ref().map(|b| b.as_ptr() as *const std::ffi::c_void).unwrap_or(std::ptr::null()),
                 cwd_w.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null()),
                 &si,
                 &mut pi,
@@ -1061,6 +1098,27 @@ mod tests {
             assert_eq!(stop_gracefully(&mut c, Duration::from_secs(1)).unwrap(), StopOutcome::AlreadyExited);
             assert!(!pid_alive(c.id()));
         }
+    }
+
+    /// An `env` addition reaches the child and leaves this process alone.
+    #[test]
+    fn an_env_addition_reaches_the_child_only() {
+        use super::*;
+        let dir = std::env::temp_dir().join(format!("hclines-env-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let out = dir.join("out.txt");
+        #[cfg(unix)]
+        let cmd = SidecarCommand::new("/bin/sh").arg("-c").arg("printf '%s|%s' \"$HCL_TEST_VAR\" \"$PATH\"");
+        #[cfg(windows)]
+        let cmd = SidecarCommand::new(std::env::var_os("ComSpec").unwrap()).arg("/C").arg("echo %HCL_TEST_VAR%^|%PATH%");
+        let mut child = cmd.env("HCL_TEST_VAR", "warn,kitsune2=info").stdout(std::fs::File::create(&out).unwrap()).spawn().unwrap();
+        child.wait().unwrap();
+        let text = std::fs::read_to_string(&out).unwrap();
+        let (value, path) = text.trim().split_once('|').unwrap();
+        assert_eq!(value, "warn,kitsune2=info");
+        assert!(!path.is_empty(), "the rest of the environment is inherited");
+        assert!(std::env::var_os("HCL_TEST_VAR").is_none(), "this process is left alone");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The rules a Windows child's argv parser applies, so a config path

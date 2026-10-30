@@ -15,10 +15,13 @@
 //! re-exports below rather than declaring them yourself: two declarations
 //! of one crate at different versions cannot resolve.
 
+pub mod conductor;
 mod error;
 pub mod files;
 pub mod keystore;
 pub mod process;
+pub mod rendezvous;
+pub mod supervisor;
 pub mod reap;
 mod sidecar;
 mod line;
