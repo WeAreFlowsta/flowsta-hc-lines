@@ -16,6 +16,7 @@
 //! of one crate at different versions cannot resolve.
 
 mod error;
+pub mod process;
 mod line;
 mod record;
 mod versions;
