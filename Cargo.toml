@@ -1,0 +1,38 @@
+[package]
+name = "flowsta-hc-lines"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.93"
+license = "MIT"
+description = "Run two Holochain lines side by side in a desktop app and move a person's data from the old line to the new one"
+repository = "https://github.com/WeAreFlowsta/flowsta-hc-lines"
+readme = "README.md"
+keywords = ["holochain", "conductor", "lair", "migration"]
+publish = false
+
+[features]
+default = ["line-06", "line-07"]
+# Each Holochain line is a feature that pins the exact client crate versions
+# its conductor needs.
+line-06 = ["dep:holochain_client_06", "dep:holochain_types_06", "dep:lair_keystore_api_06", "dep:mr_bundle_06"]
+line-07 = ["dep:holochain_client_07", "dep:holochain_types_07", "dep:lair_keystore_api_07", "dep:mr_bundle_07"]
+
+[dependencies]
+# Holochain 0.6.1: conductor client 0.8.1, lair 0.6.3.
+holochain_client_06 = { package = "holochain_client", version = "=0.8.1", default-features = false, optional = true }
+holochain_types_06 = { package = "holochain_types", version = "=0.6.1", optional = true }
+lair_keystore_api_06 = { package = "lair_keystore_api", version = "=0.6.3", optional = true }
+mr_bundle_06 = { package = "mr_bundle", version = "=0.6.1", optional = true }
+# Holochain 0.7.1: conductor client 0.9.1, lair 0.7.1.
+holochain_client_07 = { package = "holochain_client", version = "=0.9.1", default-features = false, optional = true }
+holochain_types_07 = { package = "holochain_types", version = "=0.7.1", optional = true }
+lair_keystore_api_07 = { package = "lair_keystore_api", version = "=0.7.1", optional = true }
+mr_bundle_07 = { package = "mr_bundle", version = "=0.7.1", optional = true }
+
+# core2 0.4.0 (a dependency of the lair crates, through sodoken and libflate)
+# was yanked from crates.io on 2026-04-14 and its source repository archived.
+# The crate is vendored here so a fresh resolve succeeds. A [patch] does not
+# carry through a dependency: apps using this library add the same patch
+# (see the README).
+[patch.crates-io]
+core2 = { path = "vendor/core2" }

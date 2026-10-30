@@ -1,0 +1,23 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # A fresh resolve every run: a yanked or broken upstream release shows
+      # up here before it reaches an app.
+      - name: Resolve dependencies
+        run: cargo generate-lockfile
+      - name: Each line alone
+        run: |
+          cargo check --no-default-features --features line-06
+          cargo check --no-default-features --features line-07
+      - name: Both lines
+        run: cargo test --all-features
