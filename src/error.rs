@@ -13,6 +13,11 @@ pub enum Error {
     /// A sidecar binary was not found in any of the places searched.
     #[error("Sidecar {name} not found (looked for {})", .searched.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
     SidecarMissing { name: String, searched: Vec<std::path::PathBuf> },
+    #[error(transparent)]
+    KeyStore(#[from] crate::keystore::KeyStoreError),
+    /// A file or process operation failed.
+    #[error("could not {what} ({}): {source}", .path.display())]
+    Io { what: &'static str, path: std::path::PathBuf, #[source] source: std::io::Error },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

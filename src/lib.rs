@@ -17,6 +17,7 @@
 
 mod error;
 pub mod files;
+pub mod keystore;
 pub mod process;
 pub mod reap;
 mod sidecar;
