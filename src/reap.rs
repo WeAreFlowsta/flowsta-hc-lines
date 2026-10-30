@@ -52,6 +52,24 @@ pub fn should_reap(name: &str, parent: Parent, stems: &[&str]) -> bool {
     is_sidecar_name(name, stems) && matches!(parent, Parent::Gone | Parent::Foreign)
 }
 
+/// A process's executable file name: from its executable path, else from
+/// the first word of its command line, else the kernel's name for it. The
+/// last is cut to 15 characters on Linux (`vault-lair-keystore` reads
+/// `vault-lair-keys`), so it decides only when nothing else can be read: a
+/// system that hides executable paths (seen on CI runners) still matches
+/// every sidecar by its command line.
+fn process_file_name(p: &sysinfo::Process) -> String {
+    if let Some(n) = p.exe().and_then(|e| e.file_name()) {
+        return n.to_string_lossy().to_string();
+    }
+    if let Some(first) = p.cmd().first() {
+        if let Some(n) = std::path::Path::new(first).file_name() {
+            return n.to_string_lossy().to_string();
+        }
+    }
+    p.name().to_string_lossy().to_string()
+}
+
 /// Stop every orphaned sidecar named in `stems` (this app's sidecar file
 /// names, every line). Returns how many were stopped. Call before the first
 /// sidecar of this launch spawns.
@@ -62,14 +80,11 @@ pub fn reap_orphaned_sidecars(stems: &[&str]) -> u32 {
     let my_exe = std::env::current_exe().ok();
     let my_name = my_exe.as_ref().and_then(|p| p.file_name().map(|n| stem_of(&n.to_string_lossy())));
 
-    let sys = System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_exe(UpdateKind::Always)));
+    let sys = System::new_with_specifics(RefreshKind::nothing().with_processes(
+        ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_cmd(UpdateKind::Always),
+    ));
     let procs = sys.processes();
-    let full_name = |p: &sysinfo::Process| -> String {
-        match p.exe().and_then(|e| e.file_name()) {
-            Some(n) => n.to_string_lossy().to_string(),
-            None => p.name().to_string_lossy().to_string(),
-        }
-    };
+    let full_name = |p: &sysinfo::Process| -> String { process_file_name(p) };
     let is_this_app = |pid: &sysinfo::Pid| -> bool {
         procs
             .get(pid)
@@ -155,6 +170,10 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join(&name);
         std::fs::copy("/bin/sleep", &fake).unwrap();
+        // A child another test forks while the copy is open for writing
+        // holds it until its exec, and running the copy then fails with
+        // "text file busy": let any such child get to its exec first.
+        std::thread::sleep(std::time::Duration::from_millis(300));
         std::process::Command::new("sh").arg("-c").arg(format!("nohup '{}' 300 >/dev/null 2>&1 &", fake.display())).status().unwrap();
         let mut mine = std::process::Command::new(&fake).arg("300").spawn().unwrap();
 
@@ -169,14 +188,16 @@ mod tests {
         if reaped == 0 {
             // Say what the scan saw, so a failure on another machine explains itself.
             use sysinfo::{ProcessRefreshKind, RefreshKind, System, UpdateKind};
-            let sys = System::new_with_specifics(RefreshKind::nothing().with_processes(ProcessRefreshKind::nothing().with_exe(UpdateKind::Always)));
+            let sys = System::new_with_specifics(RefreshKind::nothing().with_processes(
+                ProcessRefreshKind::nothing().with_exe(UpdateKind::Always).with_cmd(UpdateKind::Always),
+            ));
             let seen: Vec<String> = sys
                 .processes()
                 .iter()
                 .filter(|(_, p)| p.name().to_string_lossy().starts_with("hclines-test") || p.exe().map(|e| e.ends_with(&name)).unwrap_or(false))
                 .map(|(pid, p)| {
                     let parent = p.parent().and_then(|pp| sys.process(pp).map(|q| format!("{pp} {:?} exe {:?}", q.name(), q.exe())));
-                    format!("pid {pid} name {:?} exe {:?} thread {:?} parent {:?}", p.name(), p.exe(), p.thread_kind(), parent)
+                    format!("pid {pid} name {:?} exe {:?} cmd {:?} thread {:?} parent {:?}", p.name(), p.exe(), p.cmd(), p.thread_kind(), parent)
                 })
                 .collect();
             panic!("the parentless one is stopped (0 reaped); me {} exe {:?}; seen: {:#?}", std::process::id(), std::env::current_exe().ok(), seen);

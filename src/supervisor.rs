@@ -232,6 +232,237 @@ pub async fn start_line(s: &LineStart<'_>, mut on_step: impl FnMut(StartStep) + 
     })
 }
 
+// ── The supervisor: the running lines of one data root ─────────────────
+
+/// Where a line stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum LineState {
+    Off,
+    Starting,
+    Serving,
+}
+
+/// A running line as the supervisor holds it: its processes and the app
+/// interface the app attached.
+pub struct RunningLine {
+    pub process: LineProcess,
+    pub app_port: u16,
+}
+
+impl RunningLine {
+    pub fn line(&self) -> Line {
+        self.process.line
+    }
+    pub fn admin_port(&self) -> u16 {
+        self.process.admin_port
+    }
+}
+
+const LINES: [Line; 2] = [Line::V06, Line::V07];
+
+fn slot(line: Line) -> usize {
+    match line {
+        Line::V06 => 0,
+        Line::V07 => 1,
+    }
+}
+
+#[derive(Default)]
+struct Session {
+    /// 0 = no session.
+    id: u64,
+    primary: Option<Line>,
+    agent_key: Option<[u8; 32]>,
+    lines: [Option<RunningLine>; 2],
+}
+
+/// The lines of one data root, owned in one place.
+///
+/// A **session** is one start of the app's lines: it begins when the
+/// primary line is up ([`Supervisor::begin_session`]) and ends at a stop.
+/// The other line comes up later from a task and joins only the session it
+/// was started for ([`Supervisor::attach`]); one that arrives after its
+/// session ended is handed back to be stopped. Each line also has a
+/// [`LineState`], and the app's connections present one origin, shared by
+/// both lines of a start.
+pub struct Supervisor {
+    origin_prefix: String,
+    origin: std::sync::RwLock<String>,
+    sessions: std::sync::atomic::AtomicU64,
+    current: std::sync::Mutex<Session>,
+    states: std::sync::Mutex<[LineState; 2]>,
+    attaching: [std::sync::atomic::AtomicBool; 2],
+}
+
+/// Held while one line is being attached; dropping it lets the next try in.
+pub struct AttachGuard<'a> {
+    flag: &'a std::sync::atomic::AtomicBool,
+}
+
+impl Drop for AttachGuard<'_> {
+    fn drop(&mut self) {
+        self.flag.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+impl Supervisor {
+    /// `origin_prefix` names this app in its origins (`<prefix>-<32 hex>`).
+    pub fn new(origin_prefix: impl Into<String>) -> Self {
+        Self {
+            origin_prefix: origin_prefix.into(),
+            origin: std::sync::RwLock::new(String::new()),
+            sessions: std::sync::atomic::AtomicU64::new(0),
+            current: std::sync::Mutex::new(Session::default()),
+            states: std::sync::Mutex::new([LineState::Off; 2]),
+            attaching: [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)],
+        }
+    }
+
+    /// The origin in force; empty before the first start.
+    pub fn origin(&self) -> String {
+        self.origin.read().unwrap().clone()
+    }
+
+    /// A new origin for a start about to begin, in force from now on.
+    pub fn fresh_origin(&self) -> String {
+        let origin = conductor::fresh_origin(&self.origin_prefix);
+        *self.origin.write().unwrap() = origin.clone();
+        origin
+    }
+
+    /// The origin in force, made first if there is none.
+    pub fn origin_or_fresh(&self) -> String {
+        let current = self.origin();
+        if current.is_empty() { self.fresh_origin() } else { current }
+    }
+
+    /// The current session's number, if one runs.
+    pub fn session(&self) -> Option<u64> {
+        let s = self.current.lock().unwrap();
+        (s.id != 0).then_some(s.id)
+    }
+
+    pub fn primary(&self) -> Option<Line> {
+        self.current.lock().unwrap().primary
+    }
+
+    /// The key the lines run as (the same on both).
+    pub fn agent_key(&self) -> Option<[u8; 32]> {
+        self.current.lock().unwrap().agent_key
+    }
+
+    /// Begin a session on its primary line, which is up. A session still
+    /// running is ended first; its lines are returned for the caller to stop.
+    pub fn begin_session(&self, primary: RunningLine, agent_key: [u8; 32]) -> (u64, Vec<RunningLine>) {
+        let line = primary.line();
+        let id = self.sessions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let old = {
+            let mut s = self.current.lock().unwrap();
+            let old: Vec<RunningLine> = s.lines.iter_mut().filter_map(Option::take).collect();
+            *s = Session { id, primary: Some(line), agent_key: Some(agent_key), lines: [None, None] };
+            s.lines[slot(line)] = Some(primary);
+            old
+        };
+        let mut states = self.states.lock().unwrap();
+        *states = [LineState::Off; 2];
+        states[slot(line)] = LineState::Serving;
+        (id, old)
+    }
+
+    /// Attach `running` to session `session`. Handed back when that session
+    /// has ended or the line is already there: the caller stops it.
+    pub fn attach(&self, session: u64, running: RunningLine) -> std::result::Result<(), RunningLine> {
+        let line = running.line();
+        let mut s = self.current.lock().unwrap();
+        if s.id != session || s.id == 0 || s.lines[slot(line)].is_some() {
+            return Err(running);
+        }
+        s.lines[slot(line)] = Some(running);
+        drop(s);
+        self.set_state(line, LineState::Serving);
+        Ok(())
+    }
+
+    /// One attach of `line` at a time: None while another is in flight.
+    pub fn begin_attach(&self, line: Line) -> Option<AttachGuard<'_>> {
+        let flag = &self.attaching[slot(line)];
+        (!flag.swap(true, std::sync::atomic::Ordering::SeqCst)).then_some(AttachGuard { flag })
+    }
+
+    pub fn state(&self, line: Line) -> LineState {
+        self.states.lock().unwrap()[slot(line)]
+    }
+
+    pub fn set_state(&self, line: Line, state: LineState) {
+        self.states.lock().unwrap()[slot(line)] = state;
+    }
+
+    /// Whether `line` is in the current session.
+    pub fn has(&self, line: Line) -> bool {
+        self.current.lock().unwrap().lines[slot(line)].is_some()
+    }
+
+    /// `line`'s admin and app ports, when it runs.
+    pub fn ports(&self, line: Line) -> Option<(u16, u16)> {
+        self.current.lock().unwrap().lines[slot(line)].as_ref().map(|l| (l.admin_port(), l.app_port))
+    }
+
+    /// Whether `line`'s conductor still runs; None without that line.
+    pub fn alive(&self, line: Line) -> Option<bool> {
+        self.current.lock().unwrap().lines[slot(line)].as_mut().map(|l| l.process.conductor_alive())
+    }
+
+    /// Whether the primary line's conductor still runs (false with no session).
+    pub fn primary_alive(&self) -> bool {
+        let mut s = self.current.lock().unwrap();
+        match s.primary {
+            Some(p) => s.lines[slot(p)].as_mut().map(|l| l.process.conductor_alive()).unwrap_or(false),
+            None => false,
+        }
+    }
+
+    /// The primary line's admin port (0 with no session).
+    pub fn primary_admin_port(&self) -> u16 {
+        let s = self.current.lock().unwrap();
+        s.primary.and_then(|p| s.lines[slot(p)].as_ref().map(|l| l.admin_port())).unwrap_or(0)
+    }
+
+    /// Stop `line` and take it out of the session (its state goes Off). The
+    /// session goes on. Blocking: up to the line's stop graces.
+    pub fn stop_line(&self, line: Line) {
+        let taken = self.current.lock().unwrap().lines[slot(line)].take();
+        if let Some(mut l) = taken {
+            l.process.stop();
+        }
+        self.set_state(line, LineState::Off);
+    }
+
+    /// End the session: every line stopped, the 0.7 line first. Blocking.
+    /// Returns whether a session was running.
+    pub fn stop(&self) -> bool {
+        let (was, lines) = {
+            let mut s = self.current.lock().unwrap();
+            let was = s.id != 0;
+            let mut lines: Vec<RunningLine> = s.lines.iter_mut().filter_map(Option::take).collect();
+            lines.reverse();
+            *s = Session::default();
+            (was, lines)
+        };
+        for mut l in lines {
+            l.process.stop();
+        }
+        *self.states.lock().unwrap() = [LineState::Off; 2];
+        was
+    }
+
+    /// The lines that run, newest line first.
+    pub fn running_lines(&self) -> Vec<Line> {
+        let s = self.current.lock().unwrap();
+        LINES.iter().rev().copied().filter(|l| s.lines[slot(*l)].is_some()).collect()
+    }
+}
+
 /// A start runs on a multi-threaded runtime: its future must be `Send`.
 #[allow(dead_code)]
 fn start_line_is_send(s: &'static LineStart<'static>) {
@@ -332,5 +563,87 @@ mod tests {
         assert!(matches!(err, Error::Conductor(conductor::ConductorError::PortsTaken { .. })), "{err}");
         let pid: u32 = std::fs::read_to_string(lair_dir.join("pid_file")).unwrap().trim().parse().unwrap();
         assert!(!crate::process::pid_alive(pid), "the key store it started was stopped");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod session_tests {
+    use super::*;
+    use crate::process::SidecarCommand;
+
+    fn running(line: Line, port: u16) -> RunningLine {
+        let sleeper = || SidecarCommand::new("/bin/sh").arg("-c").arg("sleep 30").spawn().unwrap();
+        RunningLine {
+            process: LineProcess {
+                line,
+                lair: sleeper(),
+                conductor: sleeper(),
+                admin_port: port,
+                lair_url: String::new(),
+                agents: vec![[1u8; 32]],
+                conductor_dir: PathBuf::new(),
+                timeouts: Timeouts::default(),
+            },
+            app_port: port + 100,
+        }
+    }
+
+    #[test]
+    fn a_late_line_joins_only_its_own_session() {
+        let sup = Supervisor::new("t");
+        assert_eq!(sup.session(), None);
+        let (first, old) = sup.begin_session(running(Line::V06, 1), [1u8; 32]);
+        assert!(old.is_empty());
+        assert_eq!((sup.primary(), sup.state(Line::V06), sup.state(Line::V07)), (Some(Line::V06), LineState::Serving, LineState::Off));
+        sup.set_state(Line::V07, LineState::Starting);
+        assert!(sup.attach(first, running(Line::V07, 2)).is_ok());
+        assert_eq!((sup.state(Line::V07), sup.ports(Line::V07)), (LineState::Serving, Some((2, 102))));
+        let mut twice = sup.attach(first, running(Line::V07, 3)).expect_err("the line is already there");
+        twice.process.stop();
+        assert_eq!(sup.running_lines(), [Line::V07, Line::V06]);
+
+        assert!(sup.stop());
+        assert_eq!((sup.session(), sup.state(Line::V06), sup.state(Line::V07)), (None, LineState::Off, LineState::Off));
+        let mut late = sup.attach(first, running(Line::V07, 4)).expect_err("its session ended");
+        late.process.stop();
+
+        let (second, _) = sup.begin_session(running(Line::V07, 5), [1u8; 32]);
+        assert!(second > first);
+        let mut stale = sup.attach(first, running(Line::V06, 6)).expect_err("an earlier session's line");
+        stale.process.stop();
+        assert_eq!(sup.primary_admin_port(), 5);
+        sup.stop();
+    }
+
+    #[test]
+    fn a_dead_line_reads_dead_and_leaves_the_session_when_stopped() {
+        let sup = Supervisor::new("t");
+        let (id, _) = sup.begin_session(running(Line::V06, 1), [1u8; 32]);
+        assert!(sup.primary_alive());
+        assert_eq!(sup.alive(Line::V07), None);
+        let mut l07 = running(Line::V07, 2);
+        let _ = l07.process.conductor.kill();
+        let _ = l07.process.conductor.wait();
+        sup.attach(id, l07).ok().unwrap();
+        assert_eq!(sup.alive(Line::V07), Some(false));
+        sup.stop_line(Line::V07);
+        assert_eq!((sup.has(Line::V07), sup.state(Line::V07), sup.session()), (false, LineState::Off, Some(id)));
+        sup.stop();
+        assert!(!sup.primary_alive());
+    }
+
+    #[test]
+    fn one_attach_at_a_time_and_one_origin_per_start() {
+        let sup = Supervisor::new("fv");
+        let first = sup.begin_attach(Line::V06).expect("free");
+        assert!(sup.begin_attach(Line::V06).is_none());
+        assert!(sup.begin_attach(Line::V07).is_some(), "the other line has its own");
+        drop(first);
+        assert!(sup.begin_attach(Line::V06).is_some());
+        assert_eq!(sup.origin(), "");
+        let a = sup.origin_or_fresh();
+        assert!(a.starts_with("fv-"));
+        assert_eq!(sup.origin_or_fresh(), a, "kept while in force");
+        assert_ne!(sup.fresh_origin(), a);
     }
 }
