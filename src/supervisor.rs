@@ -463,6 +463,127 @@ impl Supervisor {
     }
 }
 
+// ── The start order: the primary line, then the other from a task ──────
+
+/// The part a line plays in a start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    /// The line the app is ready on: its start is awaited.
+    Primary,
+    /// The other line: started from a task once the session has begun.
+    Secondary,
+}
+
+/// What an app supplies for its lines; the supervisor runs the order.
+#[async_trait::async_trait]
+pub trait LineHooks: Send + Sync + 'static {
+    /// Start one line's key store and conductor, normally with [`start_line`]
+    /// and the app's settings for that line.
+    async fn start(&self, line: Line, role: Role) -> std::result::Result<LineProcess, String>;
+    /// Install the app's DNAs on a line that just came up and attach its app
+    /// interface; returns the app port. A failure stops the line.
+    async fn setup(&self, line: Line, role: Role, process: &mut LineProcess) -> std::result::Result<u16, String>;
+    /// The primary line failed once; prepare the one retry (for example,
+    /// set aside a key store that will not open). Default: retry as it is.
+    async fn before_retry(&self, _line: Line, _error: &str) {}
+    /// A line joined session `session`: the primary as the session began, a
+    /// secondary when it attached.
+    async fn joined(&self, _line: Line, _role: Role, _session: u64, _admin_port: u16, _app_port: u16) {}
+    /// A secondary line did not start; the session goes on without it.
+    async fn secondary_failed(&self, _line: Line, _error: &str) {}
+    /// A secondary line came up after its session had ended, and was stopped.
+    async fn secondary_late(&self, _line: Line) {}
+}
+
+/// Start and set up one line; a setup failure stops what was started.
+async fn start_and_setup(hooks: &dyn LineHooks, line: Line, role: Role) -> std::result::Result<RunningLine, String> {
+    let mut process = hooks.start(line, role).await?;
+    match hooks.setup(line, role, &mut process).await {
+        Ok(app_port) => Ok(RunningLine { process, app_port }),
+        Err(e) => {
+            let _ = tokio::task::spawn_blocking(move || {
+                process.stop();
+            })
+            .await;
+            Err(e)
+        }
+    }
+}
+
+impl Supervisor {
+    /// Start the `primary` line (with one retry after
+    /// [`LineHooks::before_retry`] and a 2 s pause, so ports and processes are
+    /// released), begin a session on it, then start `secondary`, if any, from
+    /// a task ([`Supervisor::attach_line`]). Returns once the primary is up;
+    /// nothing waits for the secondary.
+    pub async fn start_lines(
+        self: &std::sync::Arc<Self>,
+        primary: Line,
+        secondary: Option<Line>,
+        hooks: std::sync::Arc<dyn LineHooks>,
+    ) -> std::result::Result<u64, String> {
+        let running = match start_and_setup(hooks.as_ref(), primary, Role::Primary).await {
+            Ok(r) => r,
+            Err(e) => {
+                log::warn!("[{primary}] the primary line did not start ({e}) - one more try");
+                hooks.before_retry(primary, &e).await;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                start_and_setup(hooks.as_ref(), primary, Role::Primary).await?
+            }
+        };
+        let (admin_port, app_port) = (running.admin_port(), running.app_port);
+        let key = running.process.agents.first().copied().unwrap_or([0u8; 32]);
+        let (session, leftover) = self.begin_session(running, key);
+        for mut line in leftover {
+            log::warn!("[{}] a line was still running at a new start - stopped", line.line());
+            let _ = tokio::task::spawn_blocking(move || {
+                line.process.stop();
+            })
+            .await;
+        }
+        hooks.joined(primary, Role::Primary, session, admin_port, app_port).await;
+        if let Some(other) = secondary {
+            self.attach_line(session, other, hooks);
+        }
+        Ok(session)
+    }
+
+    /// Start `line` from a task and attach it to session `session`. Best
+    /// effort; one attach per line at a time. A line that comes up after its
+    /// session ended is stopped again.
+    pub fn attach_line(self: &std::sync::Arc<Self>, session: u64, line: Line, hooks: std::sync::Arc<dyn LineHooks>) {
+        let sup = self.clone();
+        tokio::spawn(async move {
+            let Some(_attaching) = sup.begin_attach(line) else { return };
+            if sup.session() != Some(session) || sup.has(line) {
+                return;
+            }
+            sup.set_state(line, LineState::Starting);
+            match start_and_setup(hooks.as_ref(), line, Role::Secondary).await {
+                Ok(running) => {
+                    let (admin_port, app_port) = (running.admin_port(), running.app_port);
+                    match sup.attach(session, running) {
+                        Ok(()) => hooks.joined(line, Role::Secondary, session, admin_port, app_port).await,
+                        Err(mut late) => {
+                            let _ = tokio::task::spawn_blocking(move || {
+                                late.process.stop();
+                            })
+                            .await;
+                            hooks.secondary_late(line).await;
+                        }
+                    }
+                }
+                Err(e) => {
+                    if sup.session() == Some(session) {
+                        sup.set_state(line, LineState::Off);
+                    }
+                    hooks.secondary_failed(line, &e).await;
+                }
+            }
+        });
+    }
+}
+
 /// A start runs on a multi-threaded runtime: its future must be `Send`.
 #[allow(dead_code)]
 fn start_line_is_send(s: &'static LineStart<'static>) {
@@ -645,5 +766,142 @@ mod session_tests {
         assert!(a.starts_with("fv-"));
         assert_eq!(sup.origin_or_fresh(), a, "kept while in force");
         assert_ne!(sup.fresh_origin(), a);
+    }
+}
+
+#[cfg(all(test, unix))]
+mod order_tests {
+    use super::*;
+    use crate::process::SidecarCommand;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct Fake {
+        fail_starts: Mutex<Vec<(Line, u32)>>,
+        fail_setup: Mutex<Vec<Line>>,
+        secondary_delay_ms: u64,
+        starts: AtomicU32,
+        retries: AtomicU32,
+        events: Mutex<Vec<String>>,
+    }
+
+    fn sleeper() -> SidecarChild {
+        SidecarCommand::new("/bin/sh").arg("-c").arg("sleep 30").spawn().unwrap()
+    }
+
+    #[async_trait::async_trait]
+    impl LineHooks for Fake {
+        async fn start(&self, line: Line, role: Role) -> std::result::Result<LineProcess, String> {
+            self.starts.fetch_add(1, Ordering::SeqCst);
+            if role == Role::Secondary && self.secondary_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.secondary_delay_ms)).await;
+            }
+            {
+                let mut f = self.fail_starts.lock().unwrap();
+                if let Some(entry) = f.iter_mut().find(|(l, n)| *l == line && *n > 0) {
+                    entry.1 -= 1;
+                    return Err(format!("{line} would not start"));
+                }
+            }
+            Ok(LineProcess {
+                line,
+                lair: sleeper(),
+                conductor: sleeper(),
+                admin_port: if line == Line::V06 { 1 } else { 2 },
+                lair_url: String::new(),
+                agents: vec![[9u8; 32]],
+                conductor_dir: PathBuf::new(),
+                timeouts: Timeouts::default(),
+            })
+        }
+        async fn setup(&self, line: Line, _role: Role, process: &mut LineProcess) -> std::result::Result<u16, String> {
+            if self.fail_setup.lock().unwrap().contains(&line) {
+                return Err("setup failed".into());
+            }
+            Ok(process.admin_port + 100)
+        }
+        async fn before_retry(&self, _line: Line, _error: &str) {
+            self.retries.fetch_add(1, Ordering::SeqCst);
+        }
+        async fn joined(&self, line: Line, role: Role, _session: u64, admin: u16, app: u16) {
+            self.events.lock().unwrap().push(format!("joined {line} {role:?} {admin}/{app}"));
+        }
+        async fn secondary_failed(&self, line: Line, error: &str) {
+            self.events.lock().unwrap().push(format!("failed {line}: {error}"));
+        }
+        async fn secondary_late(&self, line: Line) {
+            self.events.lock().unwrap().push(format!("late {line}"));
+        }
+    }
+
+    async fn wait_for(f: impl Fn() -> bool) {
+        for _ in 0..100 {
+            if f() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        panic!("condition not reached");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_primary_starts_and_the_secondary_joins_its_session() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let hooks = Arc::new(Fake::default());
+        let session = sup.start_lines(Line::V06, Some(Line::V07), hooks.clone()).await.unwrap();
+        assert_eq!(sup.primary(), Some(Line::V06));
+        wait_for(|| sup.has(Line::V07)).await;
+        assert_eq!(sup.session(), Some(session));
+        assert_eq!((sup.state(Line::V06), sup.state(Line::V07)), (LineState::Serving, LineState::Serving));
+        assert_eq!(*hooks.events.lock().unwrap(), ["joined 0.6 Primary 1/101", "joined 0.7 Secondary 2/102"]);
+        sup.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn one_primary_failure_is_retried_two_give_up() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let once = Arc::new(Fake { fail_starts: Mutex::new(vec![(Line::V07, 1)]), ..Fake::default() });
+        sup.start_lines(Line::V07, None, once.clone()).await.unwrap();
+        assert_eq!((once.retries.load(Ordering::SeqCst), once.starts.load(Ordering::SeqCst)), (1, 2));
+        sup.stop();
+        let twice = Arc::new(Fake { fail_starts: Mutex::new(vec![(Line::V07, 2)]), ..Fake::default() });
+        assert!(sup.start_lines(Line::V07, None, twice.clone()).await.is_err());
+        assert_eq!(sup.session(), None, "no session without a primary");
+        let setup_fails = Arc::new(Fake { fail_setup: Mutex::new(vec![Line::V07]), ..Fake::default() });
+        assert_eq!(sup.start_lines(Line::V07, None, setup_fails).await.unwrap_err(), "setup failed");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_secondary_leaves_the_session_running() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let hooks = Arc::new(Fake { fail_starts: Mutex::new(vec![(Line::V06, 1)]), ..Fake::default() });
+        let session = sup.start_lines(Line::V07, Some(Line::V06), hooks.clone()).await.unwrap();
+        wait_for(|| hooks.events.lock().unwrap().iter().any(|e| e.starts_with("failed"))).await;
+        assert_eq!((sup.session(), sup.has(Line::V06), sup.state(Line::V06)), (Some(session), false, LineState::Off));
+        sup.stop();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_secondary_after_its_session_ended_is_stopped() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let hooks = Arc::new(Fake { secondary_delay_ms: 400, ..Fake::default() });
+        sup.start_lines(Line::V06, Some(Line::V07), hooks.clone()).await.unwrap();
+        // The secondary's start is under way (the second start call) when the session ends.
+        wait_for(|| hooks.starts.load(Ordering::SeqCst) == 2).await;
+        sup.stop();
+        wait_for(|| hooks.events.lock().unwrap().iter().any(|e| e == "late 0.7")).await;
+        assert!(!sup.has(Line::V07));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_secondary_whose_session_ended_before_it_began_is_not_started() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let hooks = Arc::new(Fake::default());
+        let session = sup.start_lines(Line::V06, None, hooks.clone()).await.unwrap();
+        sup.stop();
+        sup.attach_line(session, Line::V07, hooks.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(hooks.starts.load(Ordering::SeqCst), 1, "only the primary was started");
     }
 }
