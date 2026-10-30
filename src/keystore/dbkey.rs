@@ -36,7 +36,7 @@ pub fn rekey_db_key(path: &Path, line: Line, current: &str, new: &str) -> Result
         #[cfg(feature = "line-07")]
         Line::V07 => rekey_07(path, current, new),
         #[allow(unreachable_patterns)]
-        other => Err(KeyStoreError::Lair(format!("line {other} is not compiled in")).into()),
+        other => Err(Error::LineNotCompiled(other)),
     }
 }
 

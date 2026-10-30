@@ -157,9 +157,15 @@ mod tests {
         std::fs::copy("/bin/sleep", &fake).unwrap();
         std::process::Command::new("sh").arg("-c").arg(format!("nohup '{}' 300 >/dev/null 2>&1 &", fake.display())).status().unwrap();
         let mut mine = std::process::Command::new(&fake).arg("300").spawn().unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(400));
 
-        let reaped = reap_orphaned_sidecars(&[name.as_str()]);
+        // The orphan carries the name only once nohup has exec'd it, which
+        // takes longer on a busy machine: look again until it shows.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut reaped = 0;
+        while reaped == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            reaped = reap_orphaned_sidecars(&[name.as_str()]);
+        }
         assert!(reaped >= 1, "the parentless one is stopped ({} reaped)", reaped);
         std::thread::sleep(std::time::Duration::from_millis(300));
         assert!(mine.try_wait().unwrap().is_none(), "our own child is kept");

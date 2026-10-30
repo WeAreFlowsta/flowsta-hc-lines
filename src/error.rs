@@ -15,6 +15,9 @@ pub enum Error {
     SidecarMissing { name: String, searched: Vec<std::path::PathBuf> },
     #[error(transparent)]
     KeyStore(#[from] crate::keystore::KeyStoreError),
+    /// The call needs a line this build does not include (its feature is off).
+    #[error("Holochain line {0} is not compiled into this build")]
+    LineNotCompiled(Line),
     /// A file or process operation failed.
     #[error("could not {what} ({}): {source}", .path.display())]
     Io { what: &'static str, path: std::path::PathBuf, #[source] source: std::io::Error },
