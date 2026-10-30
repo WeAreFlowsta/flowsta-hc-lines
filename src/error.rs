@@ -10,6 +10,9 @@ pub enum Error {
     /// A record or entry did not decode with the given line's types.
     #[error("{what}")]
     Decode { line: Option<Line>, what: String },
+    /// A sidecar binary was not found in any of the places searched.
+    #[error("Sidecar {name} not found (looked for {})", .searched.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", "))]
+    SidecarMissing { name: String, searched: Vec<std::path::PathBuf> },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;

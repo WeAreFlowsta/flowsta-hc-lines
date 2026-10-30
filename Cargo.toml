@@ -23,6 +23,7 @@ serde_bytes = "0.11"
 rmp-serde = "1.3"
 thiserror = "1.0"
 log = "0.4"
+sysinfo = "0.33"
 # Holochain 0.6.1: conductor client 0.8.1, lair 0.6.3.
 holochain_client_06 = { package = "holochain_client", version = "=0.8.1", default-features = false, optional = true }
 holochain_types_06 = { package = "holochain_types", version = "=0.6.1", optional = true }

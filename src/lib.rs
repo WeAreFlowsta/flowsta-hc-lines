@@ -16,7 +16,10 @@
 //! of one crate at different versions cannot resolve.
 
 mod error;
+pub mod files;
 pub mod process;
+pub mod reap;
+mod sidecar;
 mod line;
 mod record;
 mod versions;
@@ -28,6 +31,7 @@ pub use record::{record, record_opt, records, RecordView};
 pub use record::view_06;
 #[cfg(feature = "line-07")]
 pub use record::view_07;
+pub use sidecar::{resolve_sidecar, SidecarSource, TARGET_TRIPLE};
 pub use versions::{latest_versions, missing_on, Versioned};
 
 /// The Holochain 0.6 line: conductor 0.6.1, lair 0.6.3.
