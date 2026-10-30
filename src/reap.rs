@@ -56,8 +56,8 @@ pub fn should_reap(name: &str, parent: Parent, stems: &[&str]) -> bool {
 /// the first word of its command line, else the kernel's name for it. The
 /// last is cut to 15 characters on Linux (`vault-lair-keystore` reads
 /// `vault-lair-keys`), so it decides only when nothing else can be read: a
-/// system that hides executable paths (seen on CI runners) still matches
-/// every sidecar by its command line.
+/// process whose executable path cannot be read still matches by its
+/// command line.
 fn process_file_name(p: &sysinfo::Process) -> String {
     if let Some(n) = p.exe().and_then(|e| e.file_name()) {
         return n.to_string_lossy().to_string();
@@ -159,9 +159,19 @@ mod tests {
         assert!(!should_reap("holochain", Parent::Gone, STEMS));
     }
 
+    /// The fake sidecar's body: the live sweep test runs a copy of this test
+    /// binary, under the sidecar's name, with only this test selected.
+    #[test]
+    #[ignore = "run by live_sweep_stops_a_parentless_sidecar_and_keeps_our_own_child as its fake sidecar"]
+    fn fake_sidecar_sleeps() {
+        std::thread::sleep(std::time::Duration::from_secs(300));
+    }
+
     /// A process named like a sidecar of a made-up app, double-forked so its
     /// parent is gone, is stopped; one we spawned is kept. Safe on any
-    /// machine: only the made-up name is ever matched.
+    /// machine: only the made-up name is ever matched. The fake is a copy of
+    /// this test binary: a copied system tool may be a multi-call program
+    /// that refuses to run under another name (Ubuntu 26.04's coreutils).
     #[test]
     #[cfg(unix)]
     fn live_sweep_stops_a_parentless_sidecar_and_keeps_our_own_child() {
@@ -169,13 +179,14 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("hclines-reap-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let fake = dir.join(&name);
-        std::fs::copy("/bin/sleep", &fake).unwrap();
+        std::fs::copy(std::env::current_exe().unwrap(), &fake).unwrap();
+        let body = ["--ignored", "--exact", "reap::tests::fake_sidecar_sleeps", "--test-threads=1", "-q"];
         // A child another test forks while the copy is open for writing
         // holds it until its exec, and running the copy then fails with
         // "text file busy": let any such child get to its exec first.
         std::thread::sleep(std::time::Duration::from_millis(300));
-        std::process::Command::new("sh").arg("-c").arg(format!("nohup '{}' 300 >/dev/null 2>&1 &", fake.display())).status().unwrap();
-        let mut mine = std::process::Command::new(&fake).arg("300").spawn().unwrap();
+        std::process::Command::new("sh").arg("-c").arg(format!("nohup '{}' {} >/dev/null 2>&1 &", fake.display(), body.join(" "))).status().unwrap();
+        let mut mine = std::process::Command::new(&fake).args(body).stdout(std::process::Stdio::null()).spawn().unwrap();
 
         // The orphan carries the name only once nohup has exec'd it, which
         // takes longer on a busy machine: look again until it shows.
