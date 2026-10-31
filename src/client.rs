@@ -133,7 +133,7 @@ pub fn kind_06(e: &crate::v06::holochain_client::ConductorApiError) -> ZomeError
         E::ExternalApiWireError(W::ZomeCallUnauthorized(_) | W::ZomeCallAuthenticationFailed(_)) => ZomeErrorKind::Unauthorized,
         E::ExternalApiWireError(W::InternalError(t)) => internal(t),
         E::IoError(io) => kind_of_io(io),
-        E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| kind_from_text(&format!("{w:?}"))),
+        E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| websocket(&format!("{w:?}"))),
         _ => kind_from_text(&format!("{e:?}")),
     }
 }
@@ -147,7 +147,7 @@ pub fn kind_07(e: &crate::v07::holochain_client::ConductorApiError) -> ZomeError
         E::ExternalApiWireError(W::ZomeCallUnauthorized(_) | W::ZomeCallAuthenticationFailed(_)) => ZomeErrorKind::Unauthorized,
         E::ExternalApiWireError(W::InternalError(t)) => internal(t),
         E::IoError(io) => kind_of_io(io),
-        E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| kind_from_text(&format!("{w:?}"))),
+        E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| websocket(&format!("{w:?}"))),
         _ => kind_from_text(&format!("{e:?}")),
     }
 }
@@ -171,6 +171,15 @@ fn kind_of_io(io: &std::io::Error) -> ZomeErrorKind {
         K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe | K::NotConnected | K::UnexpectedEof => ZomeErrorKind::ConnectionClosed,
         K::TimedOut | K::WouldBlock => ZomeErrorKind::NoAnswer,
         _ => kind_from_text(&io.to_string()),
+    }
+}
+
+/// A websocket failure: its timeout is [`ZomeErrorKind::NoAnswer`], anything
+/// else leaves the connection unusable.
+fn websocket(t: &str) -> ZomeErrorKind {
+    match kind_from_text(t) {
+        ZomeErrorKind::Other => ZomeErrorKind::ConnectionClosed,
+        k => k,
     }
 }
 
@@ -203,10 +212,57 @@ pub(crate) fn kind_from_text(t: &str) -> ZomeErrorKind {
         ZomeErrorKind::ConnectionClosed
     } else if t.contains("response timeout") || t.contains("channel dropped") {
         ZomeErrorKind::Timeout
-    } else if t.contains("Timeout") || t.contains("deadline has elapsed") {
+    } else if t.contains("Timeout") {
         ZomeErrorKind::NoAnswer
+    } else if t.contains("Websocket error") || t.contains("WebsocketError") {
+        ZomeErrorKind::ConnectionClosed
+    } else if t.contains("InternalError") {
+        ZomeErrorKind::Internal
     } else {
         ZomeErrorKind::Other
+    }
+}
+
+/// The kind of a failure an app holds only as text: a `Result<_, String>`
+/// chain carrying a client error's `Display` or `Debug` (an admin call's
+/// error, a zome call's [`ZomeCallError`] text). The same rules as the
+/// typed classifiers' fallback, so callers never search the text
+/// themselves.
+pub fn kind_of_message(t: &str) -> ZomeErrorKind {
+    kind_from_text(t)
+}
+
+/// What a failed `install_app` says about the app.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InstallFailure {
+    /// An app with this id is installed already (a previous attempt went through).
+    AppAlreadyInstalled,
+    /// The DNA's cell exists already for this agent under another app id.
+    CellAlreadyExists,
+    /// Anything else, as a call kind.
+    Other(ZomeErrorKind),
+}
+
+/// The 0.6 client's `install_app` error, read.
+#[cfg(feature = "line-06")]
+pub fn install_failure_06(e: &crate::v06::holochain_client::ConductorApiError) -> InstallFailure {
+    install_failure(&format!("{e:?}"), || kind_06(e))
+}
+
+/// The 0.7 client's `install_app` error, read.
+#[cfg(feature = "line-07")]
+pub fn install_failure_07(e: &crate::v07::holochain_client::ConductorApiError) -> InstallFailure {
+    install_failure(&format!("{e:?}"), || kind_07(e))
+}
+
+#[allow(dead_code)]
+fn install_failure(debug: &str, kind: impl FnOnce() -> ZomeErrorKind) -> InstallFailure {
+    if debug.contains("AppAlreadyInstalled") {
+        InstallFailure::AppAlreadyInstalled
+    } else if debug.contains("CellAlreadyExists") {
+        InstallFailure::CellAlreadyExists
+    } else {
+        InstallFailure::Other(kind())
     }
 }
 
@@ -244,6 +300,26 @@ mod tests {
         assert!(ZomeErrorKind::Timeout.is_transient() && !ZomeErrorKind::Timeout.outcome_unknown());
         assert!(!ZomeErrorKind::NoAnswer.is_transient() && ZomeErrorKind::NoAnswer.outcome_unknown());
         assert!(!ZomeErrorKind::ConnectionClosed.is_transient() && ZomeErrorKind::ConnectionClosed.outcome_unknown());
+    }
+
+    #[test]
+    fn messages_held_as_text() {
+        // An admin call's Display, wrapped in the app's own label.
+        assert_eq!(kind_of_message("Admin WS: Websocket error: Io(Os { code: 10061, kind: ConnectionRefused })"), ZomeErrorKind::ConnectionRefused);
+        assert_eq!(kind_of_message("list_apps: Websocket error: Close(\"x\")"), ZomeErrorKind::ConnectionClosed);
+        assert_eq!(kind_of_message("Admin WS: Websocket error: Timeout(Elapsed(()))"), ZomeErrorKind::NoAnswer);
+        assert_eq!(kind_of_message("auth creds: External API wire error: InternalError(\"busy\")"), ZomeErrorKind::Internal);
+        assert_eq!(kind_of_message("revoke_signature zome call: External API wire error: InternalError(\"CellDisabled(..)\")"), ZomeErrorKind::CellNotRunning);
+        // A caller's own timeout message is not the client's.
+        assert_eq!(kind_of_message("get_all_sealed_at timed out after 20 s"), ZomeErrorKind::Other);
+        assert_eq!(kind_of_message("deadline has elapsed"), ZomeErrorKind::Other);
+    }
+
+    #[test]
+    fn install_failures() {
+        assert_eq!(install_failure("InternalError(\"AppAlreadyInstalled(..)\")", || ZomeErrorKind::Other), InstallFailure::AppAlreadyInstalled);
+        assert_eq!(install_failure("InternalError(\"CellAlreadyExists(..)\")", || ZomeErrorKind::Other), InstallFailure::CellAlreadyExists);
+        assert_eq!(install_failure("InternalError(\"busy\")", || ZomeErrorKind::Internal), InstallFailure::Other(ZomeErrorKind::Internal));
     }
 
     #[test]
