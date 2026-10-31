@@ -72,6 +72,85 @@ pub struct Recovery<'a> {
     pub conductor: &'a mut crate::process::SidecarChild,
 }
 
+/// How long to wait for a cell to answer, and what to re-enable between
+/// tries (a conductor can list an app as enabled while its cells are still
+/// starting, and can disable them again on a restart).
+pub struct ReadyWait<'a> {
+    pub attempts: u32,
+    pub gap: std::time::Duration,
+    pub reenable: &'a [String],
+    /// Prefix for the "not ready yet" log lines.
+    pub label: &'a str,
+}
+
+/// A signing credential grant, as each line's client hands it back.
+pub enum Grant {
+    #[cfg(feature = "line-06")]
+    V06(crate::v06::holochain_client::SigningCredentials),
+    #[cfg(feature = "line-07")]
+    V07(crate::v07::holochain_client::SigningCredentials),
+}
+
+/// Wait until a 0.6 cell answers. The probe authorizes a signing grant on
+/// it (the one signal that the cells truly run; the listed status is not),
+/// retried while the conductor says the cell is not running. The grant
+/// is a chain write, so it is handed back for the caller to keep as the
+/// session's grant, with the attempt it took.
+#[cfg(feature = "line-06")]
+pub async fn wait_cell_ready_06(
+    ws: &crate::v06::holochain_client::AdminWebsocket,
+    cell_id: &crate::v06::holochain_types::prelude::CellId,
+    w: &ReadyWait<'_>,
+) -> Result<(crate::v06::holochain_client::SigningCredentials, u32), AdminError> {
+    use crate::v06::holochain_client::AuthorizeSigningCredentialsPayload;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match ws.authorize_signing_credentials(AuthorizeSigningCredentialsPayload { cell_id: cell_id.clone(), functions: None }).await {
+            Ok(creds) => return Ok((creds, attempt)),
+            Err(e) => {
+                let e = err_06("authorize_signing_credentials", e);
+                if e.kind != ZomeErrorKind::CellNotRunning || attempt >= w.attempts {
+                    return Err(e);
+                }
+                log::info!("{} cells not ready yet (attempt {}/{}), waiting {} s", w.label, attempt, w.attempts, w.gap.as_secs());
+                tokio::time::sleep(w.gap).await;
+                for id in w.reenable {
+                    let _ = ws.enable_app(id.clone()).await;
+                }
+            }
+        }
+    }
+}
+
+/// Wait until a 0.7 cell answers: [`wait_cell_ready_06`] on the 0.7 line.
+#[cfg(feature = "line-07")]
+pub async fn wait_cell_ready_07(
+    ws: &crate::v07::holochain_client::AdminWebsocket,
+    cell_id: &crate::v07::holochain_types::prelude::CellId,
+    w: &ReadyWait<'_>,
+) -> Result<(crate::v07::holochain_client::SigningCredentials, u32), AdminError> {
+    use crate::v07::holochain_client::AuthorizeSigningCredentialsPayload;
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match ws.authorize_signing_credentials(AuthorizeSigningCredentialsPayload { cell_id: cell_id.clone(), functions: None }).await {
+            Ok(creds) => return Ok((creds, attempt)),
+            Err(e) => {
+                let e = err_07("authorize_signing_credentials", e);
+                if e.kind != ZomeErrorKind::CellNotRunning || attempt >= w.attempts {
+                    return Err(e);
+                }
+                log::info!("{} cells not ready yet (attempt {}/{}), waiting {} s", w.label, attempt, w.attempts, w.gap.as_secs());
+                tokio::time::sleep(w.gap).await;
+                for id in w.reenable {
+                    let _ = ws.enable_app(id.clone()).await;
+                }
+            }
+        }
+    }
+}
+
 /// What a recovery tries again.
 enum Retry<'r> {
     Install(&'r InstallRequest<'r>),
@@ -149,6 +228,24 @@ impl AdminClient {
             AdminClient::V07(ws) => Some(ws),
             #[allow(unreachable_patterns)]
             _ => None,
+        }
+    }
+
+    /// Wait until `probe` answers, on either line ([`wait_cell_ready_06`]).
+    pub async fn wait_cell_ready(&self, probe: &CellRef, w: &ReadyWait<'_>) -> Result<(Grant, u32), AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => {
+                use crate::v06::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let cell = CellId::new(DnaHash::from_raw_39(probe.dna_hash.clone()), AgentPubKey::from_raw_39(probe.agent_key.clone()));
+                wait_cell_ready_06(ws, &cell, w).await.map(|(g, n)| (Grant::V06(g), n))
+            }
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => {
+                use crate::v07::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let cell = CellId::new(DnaHash::from_raw_39(probe.dna_hash.clone()), AgentPubKey::from_raw_39(probe.agent_key.clone()));
+                wait_cell_ready_07(ws, &cell, w).await.map(|(g, n)| (Grant::V07(g), n))
+            }
         }
     }
 
