@@ -23,6 +23,7 @@ pub mod files;
 pub mod keeper;
 pub mod keystore;
 pub mod marker;
+pub mod pass;
 pub mod policy;
 pub mod process;
 pub mod rendezvous;
