@@ -186,15 +186,19 @@ fn websocket(t: &str) -> ZomeErrorKind {
 /// A conductor `InternalError`: a named kind when its message says one,
 /// else [`ZomeErrorKind::Internal`].
 fn internal(t: &str) -> ZomeErrorKind {
+    use ZomeErrorKind as K;
+    // The conductor answered: only the kinds it names apply, never one
+    // about this side's connection.
     match kind_from_text(t) {
-        ZomeErrorKind::Other => ZomeErrorKind::Internal,
-        k => k,
+        k @ (K::ChainHeadMoved | K::MissingFunction | K::CellNotRunning | K::ModuleBuild | K::Unauthorized | K::Timeout) => k,
+        _ => K::Internal,
     }
 }
 
-/// The conductor's message, read for what it sends only as text. The most
-/// specific match first: a timeout inside a call whose chain head moved is
-/// a moved chain head.
+/// The conductor's message, read for what it sends only as text. First the
+/// kinds the conductor names; then, once the message shows the conductor
+/// answered (an `InternalError` or `RibosomeError`), nothing in it is about
+/// this side's connection; last, this side's connection.
 pub(crate) fn kind_from_text(t: &str) -> ZomeErrorKind {
     if t.contains("chain head has moved") || t.contains("HeadMoved") {
         ZomeErrorKind::ChainHeadMoved
@@ -206,18 +210,20 @@ pub(crate) fn kind_from_text(t: &str) -> ZomeErrorKind {
         ZomeErrorKind::ModuleBuild
     } else if t.contains("nauthorized") {
         ZomeErrorKind::Unauthorized
+    } else if t.contains("response timeout") || t.contains("channel dropped") {
+        ZomeErrorKind::Timeout
+    } else if t.contains("InternalError") {
+        ZomeErrorKind::Internal
+    } else if t.contains("RibosomeError") {
+        ZomeErrorKind::Other
     } else if t.contains("ConnectionRefused") || t.contains("os error 10061") || t.contains("os error 111)") {
         ZomeErrorKind::ConnectionRefused
     } else if t.contains("ConnectionReset") || t.contains("ConnectionClosed") || t.contains("os error 10054") || t.contains("Close(") {
         ZomeErrorKind::ConnectionClosed
-    } else if t.contains("response timeout") || t.contains("channel dropped") {
-        ZomeErrorKind::Timeout
     } else if t.contains("Timeout") {
         ZomeErrorKind::NoAnswer
     } else if t.contains("Websocket error") || t.contains("WebsocketError") {
         ZomeErrorKind::ConnectionClosed
-    } else if t.contains("InternalError") {
-        ZomeErrorKind::Internal
     } else {
         ZomeErrorKind::Other
     }
@@ -313,6 +319,12 @@ mod tests {
         // A caller's own timeout message is not the client's.
         assert_eq!(kind_of_message("get_all_sealed_at timed out after 20 s"), ZomeErrorKind::Other);
         assert_eq!(kind_of_message("deadline has elapsed"), ZomeErrorKind::Other);
+        // The conductor answered: a timeout or a reset inside is its own business.
+        assert_eq!(kind_of_message("External API wire error: InternalError(\"peer Timeout\")"), ZomeErrorKind::Internal);
+        assert_eq!(kind_of_message("External API wire error: InternalError(\"ConnectionReset by peer\")"), ZomeErrorKind::Internal);
+        assert_eq!(kind_of_message("External API wire error: RibosomeError(\"Timeout in wasm\")"), ZomeErrorKind::Other);
+        assert_eq!(internal("peer Timeout"), ZomeErrorKind::Internal);
+        assert_eq!(internal("source chain head has moved"), ZomeErrorKind::ChainHeadMoved);
     }
 
     #[test]
