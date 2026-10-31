@@ -23,6 +23,7 @@ pub mod process;
 pub mod rendezvous;
 pub mod supervisor;
 pub mod reap;
+pub mod webview;
 mod sidecar;
 mod line;
 mod record;

@@ -137,8 +137,12 @@ impl SidecarCommand {
     pub fn spawn(self) -> io::Result<SidecarChild> {
         use std::process::Stdio;
         let mut cmd = Command::new(&self.program);
-        cmd.args(&self.args)
-            .envs(self.envs.iter().map(|(k, v)| (k, v)))
+        cmd.args(&self.args);
+        // The webview fix is for the app's own window, never its sidecars.
+        for k in crate::webview::set_here() {
+            cmd.env_remove(k);
+        }
+        cmd.envs(self.envs.iter().map(|(k, v)| (k, v)))
             .stdin(Stdio::piped())
             .stdout(self.stdout.map(Stdio::from).unwrap_or_else(Stdio::null))
             .stderr(self.stderr.map(Stdio::from).unwrap_or_else(Stdio::null));
