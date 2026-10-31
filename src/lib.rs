@@ -22,6 +22,7 @@ mod error;
 pub mod files;
 pub mod keeper;
 pub mod keystore;
+pub mod marker;
 pub mod process;
 pub mod rendezvous;
 pub mod supervisor;
