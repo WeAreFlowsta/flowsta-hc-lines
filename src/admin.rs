@@ -53,6 +53,31 @@ impl From<AdminError> for String {
     }
 }
 
+/// One hApp bundle to install under `app_id` for `agent_key` (39 bytes).
+pub struct InstallRequest<'a> {
+    pub app_id: &'a str,
+    pub bundle: &'a std::path::Path,
+    pub agent_key: &'a [u8],
+    /// A network seed of the app's own (a per-person network); None keeps
+    /// the bundle's.
+    pub network_seed: Option<&'a str>,
+}
+
+/// What a resilient install or enable needs to recover from a websocket the
+/// conductor reset mid-call: where to reconnect, and the conductor process,
+/// so a conductor that died is noticed at once instead of waited on.
+pub struct Recovery<'a> {
+    pub admin_port: u16,
+    pub origin: &'a str,
+    pub conductor: &'a mut crate::process::SidecarChild,
+}
+
+/// What a recovery tries again.
+enum Retry<'r> {
+    Install(&'r InstallRequest<'r>),
+    Enable(&'r str),
+}
+
 /// A coordinator zome to hot-swap: `name`, depending on `name` + `_integrity`.
 pub struct CoordinatorZome<'a> {
     pub name: &'a str,
@@ -105,6 +130,143 @@ impl AdminClient {
             #[cfg(feature = "line-07")]
             AdminClient::V07(_) => Line::V07,
         }
+    }
+
+    /// The 0.6 websocket, for calls this client does not wrap.
+    #[cfg(feature = "line-06")]
+    pub fn as_v06(&self) -> Option<&crate::v06::holochain_client::AdminWebsocket> {
+        match self {
+            AdminClient::V06(ws) => Some(ws),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// The 0.7 websocket, for calls this client does not wrap.
+    #[cfg(feature = "line-07")]
+    pub fn as_v07(&self) -> Option<&crate::v07::holochain_client::AdminWebsocket> {
+        match self {
+            AdminClient::V07(ws) => Some(ws),
+            #[allow(unreachable_patterns)]
+            _ => None,
+        }
+    }
+
+    /// Install one bundle. Not enabled yet: see [`AdminClient::enable`].
+    pub async fn install(&self, req: &InstallRequest<'_>) -> Result<(), AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => {
+                use crate::v06::holochain_client::InstallAppPayload;
+                use crate::v06::holochain_types::{app::AppBundleSource, prelude::AgentPubKey};
+                ws.install_app(InstallAppPayload {
+                    source: AppBundleSource::Path(req.bundle.to_path_buf()),
+                    agent_key: Some(AgentPubKey::from_raw_39(req.agent_key.to_vec())),
+                    installed_app_id: Some(req.app_id.to_string()),
+                    network_seed: req.network_seed.map(str::to_string),
+                    roles_settings: None,
+                    ignore_genesis_failure: false,
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| err_06("install_app", e))
+            }
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => {
+                use crate::v07::holochain_client::InstallAppPayload;
+                use crate::v07::holochain_types::{app::AppBundleSource, prelude::AgentPubKey};
+                ws.install_app(InstallAppPayload {
+                    source: AppBundleSource::Path(req.bundle.to_path_buf()),
+                    agent_key: Some(AgentPubKey::from_raw_39(req.agent_key.to_vec())),
+                    installed_app_id: Some(req.app_id.to_string()),
+                    network_seed: req.network_seed.map(str::to_string),
+                    roles_settings: None,
+                    ignore_genesis_failure: false,
+                    restore_from_dht: false,
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| err_07("install_app", e))
+            }
+        }
+    }
+
+    /// Install, surviving a websocket the conductor reset mid-call. A first
+    /// install of a sizeable hApp compiles its wasm long enough for the
+    /// conductor to reset the admin request (Windows 10054, `ConnectionClosed`)
+    /// while the conductor stays up and the compiled wasm is cached; so on a
+    /// failure: reconnect, check whether the install went through, try again,
+    /// every 3 s for up to 30 s, and stop at once if the conductor exited.
+    pub async fn install_resilient(&mut self, req: &InstallRequest<'_>, rec: Recovery<'_>) -> Result<(), AdminError> {
+        if self.install(req).await.is_ok() {
+            return Ok(());
+        }
+        log::warn!("[install] {} initial install_app failed - reconnecting and polling for status", req.app_id);
+        self.recover("install_app", req.app_id, rec, Retry::Install(req)).await
+    }
+
+    /// Enable, surviving a websocket reset mid-call (a first enable compiles
+    /// wasm too): the same recovery as [`AdminClient::install_resilient`],
+    /// done once the app reads as enabled.
+    pub async fn enable_resilient(&mut self, app_id: &str, rec: Recovery<'_>) -> Result<(), AdminError> {
+        if self.enable(app_id).await.is_ok() {
+            return Ok(());
+        }
+        log::warn!("[enable] {} initial enable_app failed - reconnecting and polling for status", app_id);
+        self.recover("enable_app", app_id, rec, Retry::Enable(app_id)).await
+    }
+
+    async fn recover(&mut self, op: &'static str, app_id: &str, rec: Recovery<'_>, what: Retry<'_>) -> Result<(), AdminError> {
+        let need_enabled = matches!(what, Retry::Enable(_));
+        let tag = if need_enabled { "enable" } else { "install" };
+        let line = self.line();
+        let started = std::time::Instant::now();
+        // 30 s is plenty for a healthy conductor's slow wasm compile; a
+        // conductor that died will not recover by waiting (its owner starts a
+        // fresh one that warm-starts on what is on disk).
+        let deadline = started + std::time::Duration::from_secs(30);
+        let mut attempts: u32 = 0;
+        while std::time::Instant::now() < deadline {
+            attempts += 1;
+            tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+            if let Ok(Some(status)) = rec.conductor.try_wait() {
+                return Err(AdminError {
+                    op,
+                    kind: ZomeErrorKind::ConnectionRefused,
+                    detail: format!("{op}({app_id}) bailing: conductor process exited (status {status}) after {}ms", started.elapsed().as_millis()),
+                });
+            }
+            match AdminClient::connect(line, rec.admin_port, rec.origin).await {
+                Ok(c) => *self = c,
+                Err(e) => {
+                    log::warn!("[{tag}] {app_id} reconnect attempt {attempts} failed: {e}");
+                    continue;
+                }
+            }
+            // Did it go through server-side despite the lost response?
+            match self.list_apps().await {
+                Ok(apps) if apps.iter().any(|a| a.app_id == app_id && (!need_enabled || a.enabled)) => {
+                    log::info!("[{tag}] {app_id} confirmed after {}ms ({attempts} attempts)", started.elapsed().as_millis());
+                    return Ok(());
+                }
+                Ok(_) => match match &what {
+                    Retry::Install(req) => self.install(req).await,
+                    Retry::Enable(id) => self.enable(id).await,
+                } {
+                    Ok(()) => {
+                        log::info!("[{tag}] {app_id} retry succeeded after {}ms ({attempts} attempts)", started.elapsed().as_millis());
+                        return Ok(());
+                    }
+                    Err(e) => log::warn!("[{tag}] {app_id} retry attempt {attempts} failed: {e} - continuing to poll"),
+                },
+                Err(e) => log::warn!("[{tag}] {app_id} list_apps attempt {attempts} failed: {e} - continuing to poll"),
+            }
+        }
+        Err(AdminError {
+            op,
+            kind: ZomeErrorKind::NoAnswer,
+            detail: format!("{op}({app_id}) gave up after {}s ({attempts} attempts)", started.elapsed().as_secs()),
+        })
     }
 
     /// Every installed app.
