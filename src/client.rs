@@ -1,0 +1,250 @@
+//! Talking to a line's app interface: one client over both lines, and a
+//! zome call's failure as a kind a caller can decide on, instead of text it
+//! has to search.
+//!
+//! The kind comes from the client crate's own error variants where it has
+//! one (an unauthorized call, a websocket timeout, an I/O error), and from
+//! the conductor's message only where the conductor sends nothing more
+//! precise (a chain head that moved, a cell not running, a missing zome
+//! function). Those messages are read here, in one place per line, with
+//! tests; callers never search them.
+//!
+//! The error's text is the text callers matched on before this module
+//! existed (`"<fn> failed: <client error Debug>"`), so a caller not yet
+//! ported keeps working.
+
+use crate::Line;
+
+/// What went wrong with a zome call, as far as a caller decides on it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ZomeErrorKind {
+    /// Another write to the source chain landed first.
+    ChainHeadMoved,
+    /// The DNA has no such zome function (an older coordinator).
+    MissingFunction,
+    /// The call's capability or signature was refused.
+    Unauthorized,
+    /// The cell is disabled or not running yet (0.6 says `CellDisabled`,
+    /// 0.7.1 `CellNotRunning`).
+    CellNotRunning,
+    /// The call, or a network read inside it, ran out of time.
+    Timeout,
+    /// The websocket closed or the connection was reset.
+    ConnectionClosed,
+    /// Nothing is listening on the port.
+    ConnectionRefused,
+    /// The coordinator's wasm did not compile: permanent for this build.
+    ModuleBuild,
+    /// Anything else; the text is in [`ZomeCallError::detail`].
+    Other,
+}
+
+impl ZomeErrorKind {
+    /// Worth another try after a short wait.
+    pub fn is_transient(self) -> bool {
+        matches!(self, Self::ChainHeadMoved | Self::CellNotRunning | Self::Timeout | Self::ConnectionClosed)
+    }
+}
+
+/// A failed zome call.
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("{fn_name} failed: {detail}")]
+pub struct ZomeCallError {
+    pub fn_name: String,
+    pub kind: ZomeErrorKind,
+    /// The client crate's error, as its `Debug` text.
+    pub detail: String,
+}
+
+/// For apps whose functions still return `Result<_, String>`.
+impl From<ZomeCallError> for String {
+    fn from(e: ZomeCallError) -> String {
+        e.to_string()
+    }
+}
+
+/// An app websocket on one of the two lines.
+pub enum AppClient {
+    #[cfg(feature = "line-06")]
+    V06(crate::v06::holochain_client::AppWebsocket),
+    #[cfg(feature = "line-07")]
+    V07(crate::v07::holochain_client::AppWebsocket),
+}
+
+impl AppClient {
+    pub fn line(&self) -> Line {
+        match self {
+            #[cfg(feature = "line-06")]
+            AppClient::V06(_) => Line::V06,
+            #[cfg(feature = "line-07")]
+            AppClient::V07(_) => Line::V07,
+        }
+    }
+
+    /// Call a zome function. `payload` is the msgpack of the input; the
+    /// result is the msgpack of the output.
+    pub async fn call(&self, role: &str, zome: &str, fn_name: &str, payload: Vec<u8>) -> Result<Vec<u8>, ZomeCallError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AppClient::V06(c) => {
+                use crate::v06::holochain_client::ZomeCallTarget;
+                use crate::v06::holochain_types::prelude::ExternIO;
+                c.call_zome(ZomeCallTarget::RoleName(role.into()), zome.into(), fn_name.into(), ExternIO::from(payload))
+                    .await
+                    .map(|io| io.into_vec())
+                    .map_err(|e| ZomeCallError { fn_name: fn_name.to_string(), kind: kind_06(&e), detail: format!("{e:?}") })
+            }
+            #[cfg(feature = "line-07")]
+            AppClient::V07(c) => {
+                use crate::v07::holochain_client::ZomeCallTarget;
+                use crate::v07::holochain_types::prelude::ExternIO;
+                c.call_zome(ZomeCallTarget::RoleName(role.into()), zome.into(), fn_name.into(), ExternIO::from(payload))
+                    .await
+                    .map(|io| io.into_vec())
+                    .map_err(|e| ZomeCallError { fn_name: fn_name.to_string(), kind: kind_07(&e), detail: format!("{e:?}") })
+            }
+        }
+    }
+}
+
+/// The 0.6 client's error as a kind.
+#[cfg(feature = "line-06")]
+pub fn kind_06(e: &crate::v06::holochain_client::ConductorApiError) -> ZomeErrorKind {
+    use crate::v06::holochain_client::ConductorApiError as E;
+    use holochain_conductor_api_06::ExternalApiWireError as W;
+    match e {
+        E::ExternalApiWireError(W::ZomeCallUnauthorized(_) | W::ZomeCallAuthenticationFailed(_)) => ZomeErrorKind::Unauthorized,
+        E::IoError(io) => kind_of_io(io),
+        E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| kind_from_text(&format!("{w:?}"))),
+        _ => kind_from_text(&format!("{e:?}")),
+    }
+}
+
+/// The 0.7 client's error as a kind.
+#[cfg(feature = "line-07")]
+pub fn kind_07(e: &crate::v07::holochain_client::ConductorApiError) -> ZomeErrorKind {
+    use crate::v07::holochain_client::ConductorApiError as E;
+    use holochain_conductor_api_07::ExternalApiWireError as W;
+    match e {
+        E::ExternalApiWireError(W::ZomeCallUnauthorized(_) | W::ZomeCallAuthenticationFailed(_)) => ZomeErrorKind::Unauthorized,
+        E::IoError(io) => kind_of_io(io),
+        E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| kind_from_text(&format!("{w:?}"))),
+        _ => kind_from_text(&format!("{e:?}")),
+    }
+}
+
+/// An I/O error anywhere under a websocket error, as a kind.
+fn kind_of_chain(e: &(dyn std::error::Error + 'static)) -> Option<ZomeErrorKind> {
+    let mut cur = Some(e);
+    while let Some(err) = cur {
+        if let Some(io) = err.downcast_ref::<std::io::Error>() {
+            return Some(kind_of_io(io));
+        }
+        cur = err.source();
+    }
+    None
+}
+
+fn kind_of_io(io: &std::io::Error) -> ZomeErrorKind {
+    use std::io::ErrorKind as K;
+    match io.kind() {
+        K::ConnectionRefused => ZomeErrorKind::ConnectionRefused,
+        K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe | K::NotConnected | K::UnexpectedEof => ZomeErrorKind::ConnectionClosed,
+        K::TimedOut | K::WouldBlock => ZomeErrorKind::Timeout,
+        _ => kind_from_text(&io.to_string()),
+    }
+}
+
+/// The conductor's message, read for what it sends only as text. The most
+/// specific match first: a timeout inside a call whose chain head moved is
+/// a moved chain head.
+pub(crate) fn kind_from_text(t: &str) -> ZomeErrorKind {
+    if t.contains("chain head has moved") || t.contains("HeadMoved") {
+        ZomeErrorKind::ChainHeadMoved
+    } else if t.contains("zome function that doesn't exist") {
+        ZomeErrorKind::MissingFunction
+    } else if t.contains("CellDisabled") || t.contains("CellNotRunning") {
+        ZomeErrorKind::CellNotRunning
+    } else if t.contains("ModuleBuild") {
+        ZomeErrorKind::ModuleBuild
+    } else if t.contains("nauthorized") {
+        ZomeErrorKind::Unauthorized
+    } else if t.contains("ConnectionRefused") || t.contains("os error 10061") || t.contains("os error 111)") {
+        ZomeErrorKind::ConnectionRefused
+    } else if t.contains("ConnectionReset") || t.contains("ConnectionClosed") || t.contains("os error 10054") || t.contains("Close(") {
+        ZomeErrorKind::ConnectionClosed
+    } else if t.contains("response timeout") || t.contains("channel dropped") || t.contains("Timeout") || t.contains("deadline has elapsed") {
+        ZomeErrorKind::Timeout
+    } else {
+        ZomeErrorKind::Other
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_messages_callers_matched_map_to_their_kinds() {
+        // The texts the Vault searched for before this module (commands.rs,
+        // sealed.rs, dna.rs), as the client's Debug carries them.
+        for (t, k) in [
+            ("RibosomeError(\"source chain head has moved\")", ZomeErrorKind::ChainHeadMoved),
+            ("RibosomeError(\"Attempted to call a zome function that doesn't exist: Zome: x Fn: y\")", ZomeErrorKind::MissingFunction),
+            ("InternalError(\"CellDisabled(...)\")", ZomeErrorKind::CellNotRunning),
+            ("InternalError(\"CellNotRunning(...)\")", ZomeErrorKind::CellNotRunning),
+            ("InternalError(\"ModuleBuild(...)\")", ZomeErrorKind::ModuleBuild),
+            ("ZomeCallUnauthorized(\"...\")", ZomeErrorKind::Unauthorized),
+            ("RibosomeError(\"... response timeout ...\")", ZomeErrorKind::Timeout),
+            ("RibosomeError(\"get response channel dropped\")", ZomeErrorKind::Timeout),
+            ("Io(Os { code: 10061, kind: ConnectionRefused })", ZomeErrorKind::ConnectionRefused),
+            ("Io(Os { code: 10054, kind: ConnectionReset })", ZomeErrorKind::ConnectionClosed),
+            ("RibosomeError(\"Wasm runtime error\")", ZomeErrorKind::Other),
+        ] {
+            assert_eq!(kind_from_text(t), k, "{t}");
+        }
+    }
+
+    #[test]
+    fn a_moved_chain_head_wins_over_a_timeout() {
+        assert_eq!(kind_from_text("chain head has moved after response timeout"), ZomeErrorKind::ChainHeadMoved);
+    }
+
+    #[test]
+    fn io_errors_by_their_kind() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(kind_of_io(&Error::from(ErrorKind::ConnectionRefused)), ZomeErrorKind::ConnectionRefused);
+        assert_eq!(kind_of_io(&Error::from(ErrorKind::ConnectionReset)), ZomeErrorKind::ConnectionClosed);
+        assert_eq!(kind_of_io(&Error::from(ErrorKind::TimedOut)), ZomeErrorKind::Timeout);
+    }
+
+    #[test]
+    fn the_text_is_the_old_text() {
+        let e = ZomeCallError { fn_name: "get_x".into(), kind: ZomeErrorKind::Other, detail: "RibosomeError(\"y\")".into() };
+        assert_eq!(e.to_string(), "get_x failed: RibosomeError(\"y\")");
+    }
+
+    #[cfg(feature = "line-06")]
+    #[test]
+    fn line_06_variants() {
+        use crate::v06::holochain_client::ConductorApiError as E;
+        use holochain_conductor_api_06::ExternalApiWireError as W;
+        assert_eq!(kind_06(&E::ExternalApiWireError(W::ZomeCallUnauthorized("x".into()))), ZomeErrorKind::Unauthorized);
+        assert_eq!(kind_06(&E::ExternalApiWireError(W::RibosomeError("source chain head has moved".into()))), ZomeErrorKind::ChainHeadMoved);
+        assert_eq!(kind_06(&E::ExternalApiWireError(W::InternalError("CellDisabled".into()))), ZomeErrorKind::CellNotRunning);
+        assert_eq!(kind_06(&E::IoError(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))), ZomeErrorKind::ConnectionRefused);
+        assert_eq!(kind_06(&E::CellNotFound), ZomeErrorKind::Other);
+    }
+
+    #[cfg(feature = "line-07")]
+    #[test]
+    fn line_07_variants() {
+        use crate::v07::holochain_client::ConductorApiError as E;
+        use holochain_conductor_api_07::ExternalApiWireError as W;
+        assert_eq!(kind_07(&E::ExternalApiWireError(W::ZomeCallAuthenticationFailed("x".into()))), ZomeErrorKind::Unauthorized);
+        assert_eq!(kind_07(&E::ExternalApiWireError(W::InternalError("CellNotRunning".into()))), ZomeErrorKind::CellNotRunning);
+        assert_eq!(kind_07(&E::ExternalApiWireError(W::RibosomeError("zome function that doesn't exist".into()))), ZomeErrorKind::MissingFunction);
+        assert_eq!(kind_07(&E::IoError(std::io::Error::from(std::io::ErrorKind::ConnectionReset))), ZomeErrorKind::ConnectionClosed);
+    }
+}

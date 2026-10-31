@@ -14,8 +14,8 @@ publish = false
 default = ["line-06", "line-07"]
 # Each Holochain line is a feature that pins the exact client crate versions
 # its conductor needs.
-line-06 = ["dep:holochain_client_06", "dep:holochain_types_06", "dep:lair_keystore_api_06", "dep:mr_bundle_06"]
-line-07 = ["dep:holochain_client_07", "dep:holochain_types_07", "dep:lair_keystore_api_07", "dep:mr_bundle_07"]
+line-06 = ["dep:holochain_client_06", "dep:holochain_types_06", "dep:holochain_conductor_api_06", "dep:lair_keystore_api_06", "dep:mr_bundle_06"]
+line-07 = ["dep:holochain_client_07", "dep:holochain_types_07", "dep:holochain_conductor_api_07", "dep:lair_keystore_api_07", "dep:mr_bundle_07"]
 
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
@@ -35,11 +35,14 @@ base64 = "0.22"
 # Holochain 0.6.1: conductor client 0.8.1, lair 0.6.3.
 holochain_client_06 = { package = "holochain_client", version = "=0.8.1", default-features = false, optional = true }
 holochain_types_06 = { package = "holochain_types", version = "=0.6.1", optional = true }
+# The conductor's wire errors, to classify zome call failures by variant.
+holochain_conductor_api_06 = { package = "holochain_conductor_api", version = "=0.6.1", optional = true }
 lair_keystore_api_06 = { package = "lair_keystore_api", version = "=0.6.3", optional = true }
 mr_bundle_06 = { package = "mr_bundle", version = "=0.6.1", optional = true }
 # Holochain 0.7.1: conductor client 0.9.1, lair 0.7.1.
 holochain_client_07 = { package = "holochain_client", version = "=0.9.1", default-features = false, optional = true }
 holochain_types_07 = { package = "holochain_types", version = "=0.7.1", optional = true }
+holochain_conductor_api_07 = { package = "holochain_conductor_api", version = "=0.7.1", optional = true }
 lair_keystore_api_07 = { package = "lair_keystore_api", version = "=0.7.1", optional = true }
 mr_bundle_07 = { package = "mr_bundle", version = "=0.7.1", optional = true }
 
