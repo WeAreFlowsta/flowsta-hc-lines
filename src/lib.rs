@@ -15,6 +15,7 @@
 //! re-exports below rather than declaring them yourself: two declarations
 //! of one crate at different versions cannot resolve.
 
+pub mod admin;
 pub mod client;
 pub mod conductor;
 mod error;
@@ -30,6 +31,7 @@ mod line;
 mod record;
 mod versions;
 
+pub use admin::{AdminClient, AdminError, AppSummary, CellRef, CoordinatorZome};
 pub use client::{kind_of_message, AppClient, InstallFailure, ZomeCallError, ZomeErrorKind};
 pub use error::{Error, Result};
 pub use line::{needs_update, records_held, Line};
