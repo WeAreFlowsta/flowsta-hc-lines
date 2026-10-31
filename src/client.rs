@@ -36,6 +36,9 @@ pub enum ZomeErrorKind {
     ConnectionRefused,
     /// The coordinator's wasm did not compile: permanent for this build.
     ModuleBuild,
+    /// The conductor reported an internal error that none of the kinds
+    /// above names (often passing; whether to retry is the caller's call).
+    Internal,
     /// Anything else; the text is in [`ZomeCallError::detail`].
     Other,
 }
@@ -115,6 +118,7 @@ pub fn kind_06(e: &crate::v06::holochain_client::ConductorApiError) -> ZomeError
     use holochain_conductor_api_06::ExternalApiWireError as W;
     match e {
         E::ExternalApiWireError(W::ZomeCallUnauthorized(_) | W::ZomeCallAuthenticationFailed(_)) => ZomeErrorKind::Unauthorized,
+        E::ExternalApiWireError(W::InternalError(t)) => internal(t),
         E::IoError(io) => kind_of_io(io),
         E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| kind_from_text(&format!("{w:?}"))),
         _ => kind_from_text(&format!("{e:?}")),
@@ -128,6 +132,7 @@ pub fn kind_07(e: &crate::v07::holochain_client::ConductorApiError) -> ZomeError
     use holochain_conductor_api_07::ExternalApiWireError as W;
     match e {
         E::ExternalApiWireError(W::ZomeCallUnauthorized(_) | W::ZomeCallAuthenticationFailed(_)) => ZomeErrorKind::Unauthorized,
+        E::ExternalApiWireError(W::InternalError(t)) => internal(t),
         E::IoError(io) => kind_of_io(io),
         E::WebsocketError(w) => kind_of_chain(w).unwrap_or_else(|| kind_from_text(&format!("{w:?}"))),
         _ => kind_from_text(&format!("{e:?}")),
@@ -153,6 +158,15 @@ fn kind_of_io(io: &std::io::Error) -> ZomeErrorKind {
         K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe | K::NotConnected | K::UnexpectedEof => ZomeErrorKind::ConnectionClosed,
         K::TimedOut | K::WouldBlock => ZomeErrorKind::Timeout,
         _ => kind_from_text(&io.to_string()),
+    }
+}
+
+/// A conductor `InternalError`: a named kind when its message says one,
+/// else [`ZomeErrorKind::Internal`].
+fn internal(t: &str) -> ZomeErrorKind {
+    match kind_from_text(t) {
+        ZomeErrorKind::Other => ZomeErrorKind::Internal,
+        k => k,
     }
 }
 
@@ -235,6 +249,7 @@ mod tests {
         assert_eq!(kind_06(&E::ExternalApiWireError(W::InternalError("CellDisabled".into()))), ZomeErrorKind::CellNotRunning);
         assert_eq!(kind_06(&E::IoError(std::io::Error::from(std::io::ErrorKind::ConnectionRefused))), ZomeErrorKind::ConnectionRefused);
         assert_eq!(kind_06(&E::CellNotFound), ZomeErrorKind::Other);
+        assert_eq!(kind_06(&E::ExternalApiWireError(W::InternalError("conductor busy".into()))), ZomeErrorKind::Internal);
     }
 
     #[cfg(feature = "line-07")]
@@ -246,5 +261,7 @@ mod tests {
         assert_eq!(kind_07(&E::ExternalApiWireError(W::InternalError("CellNotRunning".into()))), ZomeErrorKind::CellNotRunning);
         assert_eq!(kind_07(&E::ExternalApiWireError(W::RibosomeError("zome function that doesn't exist".into()))), ZomeErrorKind::MissingFunction);
         assert_eq!(kind_07(&E::IoError(std::io::Error::from(std::io::ErrorKind::ConnectionReset))), ZomeErrorKind::ConnectionClosed);
+        assert_eq!(kind_07(&E::ExternalApiWireError(W::InternalError("conductor busy".into()))), ZomeErrorKind::Internal);
+        assert_eq!(kind_07(&E::ExternalApiWireError(W::RibosomeError("anything else".into()))), ZomeErrorKind::Other);
     }
 }
