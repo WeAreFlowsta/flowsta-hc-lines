@@ -28,9 +28,15 @@ pub enum ZomeErrorKind {
     /// The cell is disabled or not running yet (0.6 says `CellDisabled`,
     /// 0.7.1 `CellNotRunning`).
     CellNotRunning,
-    /// The call, or a network read inside it, ran out of time.
+    /// The conductor reports that a network read inside the call ran out
+    /// of time ("response timeout", "channel dropped"): the call failed, so
+    /// nothing it would have written was written.
     Timeout,
-    /// The websocket closed or the connection was reset.
+    /// This side stopped waiting for the answer (the websocket request
+    /// timed out). The call's outcome is unknown: a write may have landed.
+    NoAnswer,
+    /// The websocket closed or the connection was reset. As with
+    /// [`ZomeErrorKind::NoAnswer`], a call in flight may have taken effect.
     ConnectionClosed,
     /// Nothing is listening on the port.
     ConnectionRefused,
@@ -44,9 +50,16 @@ pub enum ZomeErrorKind {
 }
 
 impl ZomeErrorKind {
-    /// Worth another try after a short wait.
+    /// Worth another try after a short wait, and safe to retry even for a
+    /// write: the call did not take effect.
     pub fn is_transient(self) -> bool {
-        matches!(self, Self::ChainHeadMoved | Self::CellNotRunning | Self::Timeout | Self::ConnectionClosed)
+        matches!(self, Self::ChainHeadMoved | Self::CellNotRunning | Self::Timeout | Self::ConnectionRefused)
+    }
+
+    /// The call may have taken effect even though it failed: retry a read,
+    /// never blindly a write.
+    pub fn outcome_unknown(self) -> bool {
+        matches!(self, Self::NoAnswer | Self::ConnectionClosed)
     }
 }
 
@@ -156,7 +169,7 @@ fn kind_of_io(io: &std::io::Error) -> ZomeErrorKind {
     match io.kind() {
         K::ConnectionRefused => ZomeErrorKind::ConnectionRefused,
         K::ConnectionReset | K::ConnectionAborted | K::BrokenPipe | K::NotConnected | K::UnexpectedEof => ZomeErrorKind::ConnectionClosed,
-        K::TimedOut | K::WouldBlock => ZomeErrorKind::Timeout,
+        K::TimedOut | K::WouldBlock => ZomeErrorKind::NoAnswer,
         _ => kind_from_text(&io.to_string()),
     }
 }
@@ -188,8 +201,10 @@ pub(crate) fn kind_from_text(t: &str) -> ZomeErrorKind {
         ZomeErrorKind::ConnectionRefused
     } else if t.contains("ConnectionReset") || t.contains("ConnectionClosed") || t.contains("os error 10054") || t.contains("Close(") {
         ZomeErrorKind::ConnectionClosed
-    } else if t.contains("response timeout") || t.contains("channel dropped") || t.contains("Timeout") || t.contains("deadline has elapsed") {
+    } else if t.contains("response timeout") || t.contains("channel dropped") {
         ZomeErrorKind::Timeout
+    } else if t.contains("Timeout") || t.contains("deadline has elapsed") {
+        ZomeErrorKind::NoAnswer
     } else {
         ZomeErrorKind::Other
     }
@@ -221,6 +236,17 @@ mod tests {
     }
 
     #[test]
+    fn the_conductors_timeout_is_not_ours() {
+        // A network read that timed out inside the call: nothing was written.
+        assert_eq!(kind_from_text("RibosomeError(\"... response timeout ...\")"), ZomeErrorKind::Timeout);
+        // This side stopped waiting: a write may have landed.
+        assert_eq!(kind_from_text("WebsocketError(Timeout(Elapsed(())))"), ZomeErrorKind::NoAnswer);
+        assert!(ZomeErrorKind::Timeout.is_transient() && !ZomeErrorKind::Timeout.outcome_unknown());
+        assert!(!ZomeErrorKind::NoAnswer.is_transient() && ZomeErrorKind::NoAnswer.outcome_unknown());
+        assert!(!ZomeErrorKind::ConnectionClosed.is_transient() && ZomeErrorKind::ConnectionClosed.outcome_unknown());
+    }
+
+    #[test]
     fn a_moved_chain_head_wins_over_a_timeout() {
         assert_eq!(kind_from_text("chain head has moved after response timeout"), ZomeErrorKind::ChainHeadMoved);
     }
@@ -230,7 +256,7 @@ mod tests {
         use std::io::{Error, ErrorKind};
         assert_eq!(kind_of_io(&Error::from(ErrorKind::ConnectionRefused)), ZomeErrorKind::ConnectionRefused);
         assert_eq!(kind_of_io(&Error::from(ErrorKind::ConnectionReset)), ZomeErrorKind::ConnectionClosed);
-        assert_eq!(kind_of_io(&Error::from(ErrorKind::TimedOut)), ZomeErrorKind::Timeout);
+        assert_eq!(kind_of_io(&Error::from(ErrorKind::TimedOut)), ZomeErrorKind::NoAnswer);
     }
 
     #[test]
