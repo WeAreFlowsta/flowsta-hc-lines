@@ -20,6 +20,7 @@ pub mod client;
 pub mod conductor;
 mod error;
 pub mod files;
+pub mod keeper;
 pub mod keystore;
 pub mod process;
 pub mod rendezvous;

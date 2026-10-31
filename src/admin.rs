@@ -428,6 +428,72 @@ impl AdminClient {
         }
     }
 
+    /// The cells of every enabled app, cloned cells included: the spaces this
+    /// conductor gossips in and the agents it runs there.
+    pub async fn running_cells(&self) -> Result<Vec<CellRef>, AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => {
+                use crate::v06::holochain_client::{AppStatusFilter, CellInfo};
+                let apps = ws.list_apps(Some(AppStatusFilter::Enabled)).await.map_err(|e| err_06("list_apps", e))?;
+                let mut cells = Vec::new();
+                for app in &apps {
+                    for (role, infos) in app.cell_info.iter() {
+                        for info in infos {
+                            let id = match info {
+                                CellInfo::Provisioned(c) => &c.cell_id,
+                                CellInfo::Cloned(c) => &c.cell_id,
+                                _ => continue,
+                            };
+                            cells.push(CellRef { role: role.to_string(), dna_hash: id.dna_hash().get_raw_39().to_vec(), agent_key: id.agent_pubkey().get_raw_39().to_vec() });
+                        }
+                    }
+                }
+                Ok(cells)
+            }
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => {
+                use crate::v07::holochain_client::{AppStatusFilter, CellInfo};
+                let apps = ws.list_apps(Some(AppStatusFilter::Enabled)).await.map_err(|e| err_07("list_apps", e))?;
+                let mut cells = Vec::new();
+                for app in &apps {
+                    for (role, infos) in app.cell_info.iter() {
+                        for info in infos {
+                            let id = match info {
+                                CellInfo::Provisioned(c) => &c.cell_id,
+                                CellInfo::Cloned(c) => &c.cell_id,
+                                _ => continue,
+                            };
+                            cells.push(CellRef { role: role.to_string(), dna_hash: id.dna_hash().get_raw_39().to_vec(), agent_key: id.agent_pubkey().get_raw_39().to_vec() });
+                        }
+                    }
+                }
+                Ok(cells)
+            }
+        }
+    }
+
+    /// The conductor's agent-info notes (its own and its peers'), as raw
+    /// signed strings.
+    pub async fn agent_info(&self) -> Result<Vec<String>, AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => ws.agent_info(None).await.map_err(|e| err_06("agent_info", e)),
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => ws.agent_info(None).await.map_err(|e| err_07("agent_info", e)),
+        }
+    }
+
+    /// Hand the conductor agent-info notes it did not have.
+    pub async fn add_agent_info(&self, infos: Vec<String>) -> Result<(), AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => ws.add_agent_info(infos).await.map_err(|e| err_06("add_agent_info", e)),
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => ws.add_agent_info(infos).await.map_err(|e| err_07("add_agent_info", e)),
+        }
+    }
+
     pub async fn enable(&self, app_id: &str) -> Result<(), AdminError> {
         match self {
             #[cfg(feature = "line-06")]

@@ -293,6 +293,8 @@ pub struct Supervisor {
     current: std::sync::Mutex<Session>,
     states: std::sync::Mutex<[LineState; 2]>,
     attaching: [std::sync::atomic::AtomicBool; 2],
+    rendezvous: std::sync::Mutex<[Option<String>; 2]>,
+    keeper_started: std::sync::atomic::AtomicBool,
 }
 
 /// Held while one line is being attached; dropping it lets the next try in.
@@ -316,7 +318,83 @@ impl Supervisor {
             current: std::sync::Mutex::new(Session::default()),
             states: std::sync::Mutex::new([LineState::Off; 2]),
             attaching: [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)],
+            rendezvous: std::sync::Mutex::new([None, None]),
+            keeper_started: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Record the rendezvous `line`'s conductor was configured with at its
+    /// start (the main one, or the first fallback that answered when it was
+    /// dark). The keeper calls a stall only against this one: a conductor
+    /// never registers anywhere else.
+    pub fn set_rendezvous(&self, line: Line, url: Option<&str>) {
+        self.rendezvous.lock().unwrap()[slot(line)] = url.map(|u| u.trim_end_matches('/').to_string());
+    }
+
+    /// The rendezvous `line`'s conductor was configured with (None: not
+    /// recorded; the keeper then takes the first server it was given).
+    pub fn rendezvous(&self, line: Line) -> Option<String> {
+        self.rendezvous.lock().unwrap()[slot(line)].clone()
+    }
+
+    /// Keep each running line's agents listed on its rendezvous: one
+    /// [`crate::keeper::Keeper`] per line with servers, every 60 s after the
+    /// first 70 s (the conductor's own first registration has had its
+    /// chance), for as long as this supervisor lives. Each round asks which
+    /// lines run, on which port and under which origin (a new start brings
+    /// new conductors and a new origin) and skips a line that does not run.
+    /// `servers`: the 0.6 line's `(bootstrap URL, auth material)` list, then
+    /// the 0.7 line's, the conductor's own rendezvous first. Started once per
+    /// supervisor; call it from within a tokio runtime.
+    pub fn start_keeper(self: &std::sync::Arc<Self>, servers: [Vec<(String, Option<String>)>; 2]) {
+        if servers.iter().all(|s| s.is_empty()) {
+            log::info!("[rendezvous] no rendezvous configured - nothing to keep");
+            return;
+        }
+        if self.keeper_started.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let weak = std::sync::Arc::downgrade(self);
+        tokio::spawn(async move {
+            // A gap this long between two rounds means the machine was asleep.
+            const WOKE_AFTER: std::time::Duration = std::time::Duration::from_secs(150);
+            let mut keepers = [
+                crate::keeper::Keeper::new(crate::keeper::servers_from(&servers[0])),
+                crate::keeper::Keeper::new(crate::keeper::servers_from(&servers[1])),
+            ];
+            let mut last_tick = std::time::SystemTime::now();
+            let mut wait = std::time::Duration::from_secs(70);
+            loop {
+                tokio::time::sleep(wait).await;
+                wait = std::time::Duration::from_secs(60);
+                let now = std::time::SystemTime::now();
+                if let Ok(gap) = now.duration_since(last_tick) {
+                    if gap > wait + WOKE_AFTER {
+                        log::info!("[rendezvous] back after {} min away - checking the rendezvous now", gap.as_secs() / 60);
+                    }
+                }
+                last_tick = now;
+                let Some(sup) = weak.upgrade() else { return };
+                for line in LINES {
+                    if servers[slot(line)].is_empty() {
+                        continue;
+                    }
+                    let Some((admin_port, _)) = sup.ports(line) else { continue };
+                    let label = if line == Line::V06 { "[rendezvous]" } else { "[rendezvous 0.7]" };
+                    let admin = match crate::admin::AdminClient::connect(line, admin_port, &sup.origin()).await {
+                        Ok(a) => a,
+                        Err(e) => {
+                            log::debug!("{label} round skipped: admin: {e}");
+                            continue;
+                        }
+                    };
+                    let conductor = sup.rendezvous(line);
+                    if let Err(e) = keepers[slot(line)].run_once(&admin, conductor.as_deref()).await {
+                        log::debug!("{label} round skipped: {e}");
+                    }
+                }
+            }
+        });
     }
 
     /// The origin in force; empty before the first start.
@@ -903,5 +981,21 @@ mod order_tests {
         sup.attach_line(session, Line::V07, hooks.clone());
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(hooks.starts.load(Ordering::SeqCst), 1, "only the primary was started");
+    }
+}
+
+#[cfg(test)]
+mod rendezvous_tests {
+    use super::*;
+
+    #[test]
+    fn the_conductors_rendezvous_is_kept_per_line() {
+        let s = Supervisor::new("t");
+        assert_eq!(s.rendezvous(Line::V06), None, "not recorded: the keeper takes the first server");
+        s.set_rendezvous(Line::V06, Some("https://node1.flowsta.com/"));
+        assert_eq!(s.rendezvous(Line::V06).as_deref(), Some("https://node1.flowsta.com"));
+        assert_eq!(s.rendezvous(Line::V07), None, "each line its own");
+        s.set_rendezvous(Line::V06, None);
+        assert_eq!(s.rendezvous(Line::V06), None);
     }
 }
