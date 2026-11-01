@@ -310,13 +310,15 @@ impl KitCache {
 /// previous line, so its kit stays cached. Leans to keeping it: a root with
 /// no marker that holds data on the previous line (`holds_previous` says
 /// how the app tells), a marker that does not read, and a moved root with
-/// no decision recorded all need it. A root born on the current line, or
-/// whose marker says the old line is no longer needed, does not.
+/// no decision recorded all need it. A moved root is done with it once its
+/// marker says the old line is no longer needed AND records that a pass
+/// carried everything (`carried_all_ms`: an earlier rule decided the first
+/// without the second). A root born on the current line never needs it.
 pub fn previous_line_needed(roots: &[PathBuf], spec: &MarkerSpec, holds_previous: impl Fn(&Path) -> bool) -> bool {
     roots.iter().any(|root| match Marker::load(root, spec) {
         MarkerRead::Absent => holds_previous(root),
         MarkerRead::Unreadable(_) => true,
-        MarkerRead::Present(m) => !m.born && m.old_line_needed != Some(false),
+        MarkerRead::Present(m) => !m.born && (m.old_line_needed != Some(false) || m.carried_all_ms.is_none()),
     })
 }
 
@@ -579,7 +581,8 @@ mod tests {
         let unmoved_with_data = root("unmoved", None);
         let empty = root("empty", None);
         let born = root("born", Some(r#"{"v":1,"moved_at_ms":1,"born":true}"#));
-        let done = root("done", Some(r#"{"v":1,"moved_at_ms":1,"old_needed":false}"#));
+        let done = root("done", Some(r#"{"v":1,"moved_at_ms":1,"old_needed":false,"carried_all_ms":5}"#));
+        let not_carried = root("not-carried", Some(r#"{"v":1,"moved_at_ms":1,"old_needed":false}"#));
         let still = root("still", Some(r#"{"v":1,"moved_at_ms":1,"old_needed":true}"#));
         let undecided = root("undecided", Some(r#"{"v":1,"moved_at_ms":1}"#));
         let unreadable = root("unreadable", Some("not json"));
@@ -590,6 +593,7 @@ mod tests {
         assert!(needed(&[&done, &unmoved_with_data]), "an identity that has not moved");
         assert!(needed(&[&done, &still]), "a marker that still needs it");
         assert!(needed(&[&undecided]), "no decision recorded yet");
+        assert!(needed(&[&not_carried]), "decided by the earlier rule, nothing recorded as carried");
         assert!(needed(&[&unreadable]), "a marker that does not read");
         assert!(!needed(&[]));
         let _ = std::fs::remove_dir_all(&base);
