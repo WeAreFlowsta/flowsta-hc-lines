@@ -67,6 +67,9 @@ pub enum Why {
     SiblingOnOld(String),
     /// Restored and still listening for other devices.
     Listening,
+    /// The previous line holds data, and no complete pass has run since
+    /// every other device left it: something may be left to carry.
+    NotCarried,
     Alone,
     NeverShared,
     NothingLeft,
@@ -92,9 +95,12 @@ impl Decision {
 /// 3. a kind still owed from it: wanted;
 /// 4. another, unremoved device on the previous generation: wanted;
 /// 5. restored and no device heard yet: wanted while listening (the
-///    policy's window), then not (alone);
-/// 6. never shared: not wanted;
-/// 7. otherwise: not wanted (nothing left on it).
+///    policy's window);
+/// 6. data on the previous line and no complete pass since every other
+///    device left it (`Marker::carried_all_ms`): wanted;
+/// 7. restored and alone (the window closed): not wanted;
+/// 8. never shared: not wanted;
+/// 9. otherwise: not wanted (nothing left on it).
 pub fn old_line_wanted(f: &Facts, p: &RetirementPolicy, spec: &MarkerSpec) -> Decision {
     let marker = match &f.marker {
         MarkerRead::Absent => {
@@ -118,14 +124,21 @@ pub fn old_line_wanted(f: &Facts, p: &RetirementPolicy, spec: &MarkerSpec) -> De
             return Decision::Wanted(Why::SiblingOnOld(s.device_id.clone()));
         }
     }
-    match &f.siblings {
-        Siblings::NoneHeardYet if m.restored => {
-            let closed = match (p.alone_after, m.listening_since_ms) {
-                (Some(after), Some(since)) => f.now_ms.saturating_sub(since) >= after.as_millis() as u64 && f.reachable_rounds >= p.alone_rounds,
-                _ => false,
-            };
-            if closed { Decision::NotWanted(Why::Alone) } else { Decision::Wanted(Why::Listening) }
+    let listening = matches!(f.siblings, Siblings::NoneHeardYet) && m.restored;
+    if listening {
+        let closed = match (p.alone_after, m.listening_since_ms) {
+            (Some(after), Some(since)) => f.now_ms.saturating_sub(since) >= after.as_millis() as u64 && f.reachable_rounds >= p.alone_rounds,
+            _ => false,
+        };
+        if !closed {
+            return Decision::Wanted(Why::Listening);
         }
+    }
+    if f.old_line_data_present && m.carried_all_ms.is_none() {
+        return Decision::Wanted(Why::NotCarried);
+    }
+    match &f.siblings {
+        _ if listening => Decision::NotWanted(Why::Alone),
         Siblings::NeverShared => Decision::NotWanted(Why::NeverShared),
         _ => Decision::NotWanted(Why::NothingLeft),
     }
@@ -160,8 +173,10 @@ mod tests {
     fn facts(marker: MarkerRead, siblings: Siblings) -> Facts {
         Facts { marker, old_line_data_present: true, own_device_id: Some("me".into()), siblings, owed: vec![], reachable_rounds: 0, now_ms: 1_000_000 }
     }
+    /// A marker whose last pass carried everything (unless `edit` says otherwise).
     fn present(edit: impl FnOnce(&mut Marker)) -> MarkerRead {
         let mut m = Marker::new(&SPEC, 1);
+        m.carried_all_ms = Some(2);
         edit(&mut m);
         MarkerRead::Present(m)
     }
@@ -221,6 +236,28 @@ mod tests {
     fn an_unreadable_marker_moves_the_writes_and_wants_the_old_line() {
         let (plan, d) = plan_start(&facts(MarkerRead::Unreadable("x".into()), Siblings::NoneHeardYet), &NEVER, &SPEC);
         assert_eq!((plan.primary, plan.secondary, d), (Line::V07, Some(Line::V06), Decision::Wanted(Why::NotMoved)));
+    }
+
+    #[test]
+    fn data_on_the_previous_line_is_kept_until_a_pass_has_carried_all_of_it() {
+        // A 1.7.0 marker (no carried_all_ms) and the 0.6 line's data on disk.
+        let not_carried = |edit: fn(&mut Marker), siblings| facts(present(|m| { m.carried_all_ms = None; edit(m) }), siblings);
+        let f = not_carried(|_| {}, Siblings::Heard(vec![sib("phone", "holochain-0.7", false)]));
+        assert_eq!(old_line_wanted(&f, &NEVER, &SPEC), Decision::Wanted(Why::NotCarried));
+        assert_eq!(old_line_wanted(&not_carried(|_| {}, Siblings::NeverShared), &NEVER, &SPEC), Decision::Wanted(Why::NotCarried));
+        // Nothing of it on the previous line (restored, never attached): nothing to carry.
+        let mut f = not_carried(|m| m.restored = true, Siblings::Heard(vec![]));
+        f.old_line_data_present = false;
+        assert_eq!(old_line_wanted(&f, &NEVER, &SPEC), Decision::NotWanted(Why::NothingLeft));
+        // A sibling still on it, or a restored identity still listening, says so first.
+        let f = not_carried(|_| {}, Siblings::Heard(vec![sib("laptop", "holochain-0.6", false)]));
+        assert_eq!(old_line_wanted(&f, &NEVER, &SPEC), Decision::Wanted(Why::SiblingOnOld("laptop".into())));
+        let f = not_carried(|m| { m.restored = true; m.listening_since_ms = Some(0); }, Siblings::NoneHeardYet);
+        assert_eq!(old_line_wanted(&f, &NEVER, &SPEC), Decision::Wanted(Why::Listening));
+        // Alone, the window closed: still kept until what it holds is carried.
+        let p = RetirementPolicy { alone_after: Some(std::time::Duration::from_secs(1)), alone_rounds: 0 };
+        let f = not_carried(|m| { m.restored = true; m.listening_since_ms = Some(0); }, Siblings::NoneHeardYet);
+        assert_eq!(old_line_wanted(&f, &p, &SPEC), Decision::Wanted(Why::NotCarried));
     }
 
     #[test]

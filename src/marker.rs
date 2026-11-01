@@ -10,7 +10,8 @@
 //!
 //! The file is a JSON object. This module reads and writes the line fields
 //! (`v`, `writes_to`, `moved_at_ms`, `born`, `restored`, the old-line
-//! decision under the key the app names, `listening_since_ms`) and keeps
+//! decision under the key the app names, `listening_since_ms`,
+//! `carried_all_ms`) and keeps
 //! every other key as it found it, so an app's own fields, and the fields
 //! an older version of the app requires, survive every update.
 
@@ -55,6 +56,10 @@ pub struct Marker {
     pub old_line_needed: Option<bool>,
     /// When a restored identity began listening for other devices.
     pub listening_since_ms: Option<u64>,
+    /// When a pass, complete for every kind, began with no other device on
+    /// the previous generation: nothing is left there to carry. Cleared by
+    /// a pass that finds something left or a device back on it.
+    pub carried_all_ms: Option<u64>,
     /// Every other key, verbatim.
     pub app: Map<String, Value>,
 }
@@ -79,6 +84,7 @@ impl Marker {
             restored: false,
             old_line_needed: None,
             listening_since_ms: None,
+            carried_all_ms: None,
             app: Map::new(),
         }
     }
@@ -124,12 +130,14 @@ impl Marker {
         let restored = flag(take("restored"));
         let old_line_needed = take(spec.old_line_key).and_then(|v| v.as_bool());
         let listening_since_ms = take("listening_since_ms").and_then(|v| v.as_u64());
-        Ok(Self { v, writes_to, moved_at_ms, born, restored, old_line_needed, listening_since_ms, app: map })
+        let carried_all_ms = take("carried_all_ms").and_then(|v| v.as_u64());
+        Ok(Self { v, writes_to, moved_at_ms, born, restored, old_line_needed, listening_since_ms, carried_all_ms, app: map })
     }
 
     /// The JSON object: the app's keys as found, then the line fields. The
     /// old-line key is always written (null when undecided), as earlier
-    /// versions wrote it; `writes_to` and `listening_since_ms` only when set.
+    /// versions wrote it; `writes_to`, `listening_since_ms` and
+    /// `carried_all_ms` only when set.
     pub fn to_map(&self, spec: &MarkerSpec) -> Map<String, Value> {
         let mut map = self.app.clone();
         map.insert("v".into(), Value::from(self.v));
@@ -142,6 +150,9 @@ impl Marker {
         map.insert(spec.old_line_key.into(), self.old_line_needed.map(Value::from).unwrap_or(Value::Null));
         if let Some(t) = self.listening_since_ms {
             map.insert("listening_since_ms".into(), Value::from(t));
+        }
+        if let Some(t) = self.carried_all_ms {
+            map.insert("carried_all_ms".into(), Value::from(t));
         }
         map
     }
@@ -261,6 +272,7 @@ mod tests {
         m.born = true;
         m.old_line_needed = Some(false);
         m.listening_since_ms = Some(9);
+        m.carried_all_ms = Some(11);
         m.app.insert("vault_version".into(), Value::from("1.8.0"));
         m.save(&d, &SPEC).unwrap();
         assert_eq!(Marker::load(&d, &SPEC), MarkerRead::Present(m.clone()));
@@ -270,7 +282,7 @@ mod tests {
         let mut bare = Marker::new(&SPEC, 5);
         bare.writes_to = None;
         let map = bare.to_map(&SPEC);
-        assert!(!map.contains_key("writes_to") && !map.contains_key("listening_since_ms"));
+        assert!(!map.contains_key("writes_to") && !map.contains_key("listening_since_ms") && !map.contains_key("carried_all_ms"));
         assert_eq!(map.get("line_06_needed"), Some(&Value::Null), "always written, as 1.7.0 did");
     }
 

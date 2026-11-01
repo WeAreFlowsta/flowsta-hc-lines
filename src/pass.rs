@@ -16,8 +16,12 @@
 //!   until complete; its failure is noted and the pass goes on.
 //! - Passes keep running after the flip while the previous line runs, so
 //!   what reaches it later (from another device still on it) is copied too.
+//! - A pass complete for every kind that began with no other device on the
+//!   previous generation records that nothing is left there to carry
+//!   (`Marker::carried_all_ms`, which the retirement policy reads).
 
 use crate::marker::{Marker, MarkerRead, MarkerSpec};
+use crate::policy::Siblings;
 use crate::versions::{latest_versions, missing_on, Versioned};
 use crate::Line;
 use serde_json::{Map, Value};
@@ -29,11 +33,18 @@ use std::sync::{Arc, Mutex};
 pub type HookError = Box<dyn std::error::Error + Send + Sync>;
 
 /// The app a pass runs for.
+#[async_trait::async_trait]
 pub trait PassApp: Send + Sync + 'static {
     /// Whether this line's conductor is running.
     fn line_up(&self, line: Line) -> bool;
     /// Why no pass can run now (the app is locked), or `None`.
     fn blocked(&self) -> Option<String> {
+        None
+    }
+    /// The identity's other devices as this device knows them now (this
+    /// one left out), or `None` when that cannot be read. The default,
+    /// `None`, never records that nothing is left to carry.
+    async fn siblings(_app: &Arc<Self>, _root: &Path) -> Option<Siblings> {
         None
     }
 }
@@ -328,10 +339,42 @@ impl<C: PassApp> PassRunner<C> {
         }
         let marker = Marker::load(root, &self.spec);
         let moved = Marker::writes_to(&marker, &self.spec) == self.spec.current;
+        let siblings = C::siblings(app, root).await;
         let cx = PassCx { app, root, reason, spec: &self.spec, marker: &marker, moved };
         self.steps(&cx, &mut out).await;
+        self.record_carried_all(root, siblings.as_ref(), &mut out);
         out.took_ms = started.elapsed().as_millis() as u64;
         out
+    }
+
+    /// Whether nothing is left on the previous line, from this pass:
+    /// recorded when it was complete for every kind and began with no other
+    /// device on the previous generation; cleared when a device is on it,
+    /// or the pass left something (wrote and did not finish, or finished
+    /// incomplete). A pass that failed before writing anything says nothing
+    /// new. Only an existing marker is changed (none before the flip).
+    fn record_carried_all(&self, root: &Path, siblings: Option<&Siblings>, out: &mut PassOutcome) {
+        let previous = self.spec.previous.generation();
+        let left = siblings.map(|s| match s {
+            Siblings::Heard(list) => !list.iter().any(|s| !s.removed && s.generation == previous),
+            Siblings::NoneHeardYet | Siblings::NeverShared => true,
+        });
+        let complete = out.error.is_none() && out.kinds.iter().all(|k| k.complete);
+        let wrote = out.kinds.iter().take(self.own.len()).any(|k| k.written > 0);
+        let carried_all = match left {
+            Some(false) => None,
+            _ if !complete && (wrote || out.error.is_none()) => None,
+            Some(true) if complete => Some(now_ms()),
+            _ => return,
+        };
+        let MarkerRead::Present(mut m) = Marker::load(root, &self.spec) else { return };
+        if m.carried_all_ms.is_some() == carried_all.is_some() {
+            return;
+        }
+        m.carried_all_ms = carried_all;
+        if let Err(e) = m.save(root, &self.spec) {
+            out.error.get_or_insert(format!("the marker was not updated: {e}"));
+        }
     }
 
     async fn steps(&self, cx: &PassCx<'_, C>, out: &mut PassOutcome) {
@@ -475,14 +518,19 @@ mod tests {
         carry_fails: Mutex<Vec<&'static str>>,
         carry_calls: Mutex<Vec<&'static str>>,
         flipped: AtomicUsize,
+        siblings: Mutex<Option<Siblings>>,
     }
 
+    #[async_trait::async_trait]
     impl PassApp for App {
         fn line_up(&self, line: Line) -> bool {
             !self.down.lock().unwrap().contains(&line)
         }
         fn blocked(&self) -> Option<String> {
             self.locked.load(Ordering::SeqCst).then(|| "locked".to_string())
+        }
+        async fn siblings(app: &Arc<Self>, _root: &Path) -> Option<Siblings> {
+            app.siblings.lock().unwrap().clone()
         }
     }
 
@@ -710,6 +758,65 @@ mod tests {
         let o = runner(false, vec![none]).run(&app, dir.path(), "t").await;
         assert!(o.kind("notes").unwrap().complete && o.kind("web era").unwrap().complete);
         assert!(app.written.lock().unwrap().is_empty() && o.flipped);
+    }
+
+    fn carried_all(root: &Path) -> Option<u64> {
+        match Marker::load(root, &SPEC) {
+            MarkerRead::Present(m) => m.carried_all_ms,
+            _ => None,
+        }
+    }
+    fn on(generation: &str) -> Siblings {
+        Siblings::Heard(vec![crate::policy::Sibling { device_id: "laptop".into(), generation: generation.into(), removed: false }])
+    }
+
+    #[tokio::test]
+    async fn a_complete_pass_with_no_device_on_the_previous_line_records_that_nothing_is_left() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(vec![v("a", 1000, 1)], vec![]);
+        let r = runner(true, vec![]);
+        // Unknown siblings: the flip happens, nothing is recorded.
+        assert!(r.run(&app, dir.path(), "t").await.flipped);
+        assert_eq!(carried_all(dir.path()), None);
+        // A device still on the previous generation: not recorded either.
+        *app.siblings.lock().unwrap() = Some(on("holochain-0.6"));
+        r.run(&app, dir.path(), "t").await;
+        assert_eq!(carried_all(dir.path()), None);
+        // It moved: the next complete pass records it, and it stays.
+        *app.siblings.lock().unwrap() = Some(on("holochain-0.7"));
+        r.run(&app, dir.path(), "t").await;
+        let at = carried_all(dir.path()).expect("recorded");
+        r.run(&app, dir.path(), "t").await;
+        assert_eq!(carried_all(dir.path()), Some(at), "written only when it changes");
+        // A device back on the previous generation clears it.
+        *app.siblings.lock().unwrap() = Some(on("holochain-0.6"));
+        r.run(&app, dir.path(), "t").await;
+        assert_eq!(carried_all(dir.path()), None);
+    }
+
+    #[tokio::test]
+    async fn a_pass_that_leaves_something_clears_it_and_a_failure_before_writing_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = app(vec![v("a", 1000, 1)], vec![]);
+        *app.siblings.lock().unwrap() = Some(Siblings::NeverShared);
+        let r = runner(true, vec![]);
+        r.run(&app, dir.path(), "t").await;
+        assert!(carried_all(dir.path()).is_some(), "the flip pass, complete, records it");
+        // A failure before anything was written: nothing new is known.
+        app.lines.lock().unwrap().get_mut(&Line::V06).unwrap().push(v("b", 2000, 2));
+        app.fail_write.store(true, Ordering::SeqCst);
+        assert!(r.run(&app, dir.path(), "t").await.error.is_some());
+        assert!(carried_all(dir.path()).is_some());
+        // A write that does not read back: something is left.
+        app.fail_write.store(false, Ordering::SeqCst);
+        app.lose_writes.store(true, Ordering::SeqCst);
+        let o = r.run(&app, dir.path(), "t").await;
+        assert!(o.error.is_none() && !o.kinds[0].complete);
+        assert_eq!(carried_all(dir.path()), None);
+        // Carried after all: recorded again.
+        app.lose_writes.store(false, Ordering::SeqCst);
+        r.run(&app, dir.path(), "t").await;
+        assert!(carried_all(dir.path()).is_some());
     }
 
     /// Writes a marker with a key of its own while the pass runs.
