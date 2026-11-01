@@ -295,6 +295,7 @@ pub struct Supervisor {
     attaching: [std::sync::atomic::AtomicBool; 2],
     rendezvous: std::sync::Mutex<[Option<String>; 2]>,
     keeper_started: std::sync::atomic::AtomicBool,
+    reachable: [std::sync::atomic::AtomicU64; 2],
 }
 
 /// Held while one line is being attached; dropping it lets the next try in.
@@ -320,6 +321,20 @@ impl Supervisor {
             attaching: [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)],
             rendezvous: std::sync::Mutex::new([None, None]),
             keeper_started: std::sync::atomic::AtomicBool::new(false),
+            reachable: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
+        }
+    }
+
+    /// Keeper rounds on `line` in which a rendezvous answered, for this
+    /// supervisor's life: the rounds a device was online on that line (what
+    /// a listen window counts, [`crate::marker::ListenTally`]).
+    pub fn reachable_rounds(&self, line: Line) -> u64 {
+        self.reachable[slot(line)].load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn count_round(&self, line: Line, round: &crate::keeper::Round) {
+        if round.reached > 0 {
+            self.reachable[slot(line)].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
     }
 
@@ -389,8 +404,9 @@ impl Supervisor {
                         }
                     };
                     let conductor = sup.rendezvous(line);
-                    if let Err(e) = keepers[slot(line)].run_once(&admin, conductor.as_deref()).await {
-                        log::debug!("{label} round skipped: {e}");
+                    match keepers[slot(line)].run_once(&admin, conductor.as_deref()).await {
+                        Ok(round) => sup.count_round(line, &round),
+                        Err(e) => log::debug!("{label} round skipped: {e}"),
                     }
                 }
             }
@@ -829,6 +845,16 @@ mod session_tests {
         assert_eq!((sup.has(Line::V07), sup.state(Line::V07), sup.session()), (false, LineState::Off, Some(id)));
         sup.stop();
         assert!(!sup.primary_alive());
+    }
+
+    #[test]
+    fn a_round_counts_as_reachable_only_when_a_rendezvous_answered() {
+        let sup = Supervisor::new("t");
+        sup.count_round(Line::V06, &crate::keeper::Round::default());
+        sup.count_round(Line::V06, &crate::keeper::Round { reached: 1, ..Default::default() });
+        sup.count_round(Line::V07, &crate::keeper::Round { reached: 2, ..Default::default() });
+        sup.count_round(Line::V06, &crate::keeper::Round { reached: 1, ..Default::default() });
+        assert_eq!((sup.reachable_rounds(Line::V06), sup.reachable_rounds(Line::V07)), (2, 1));
     }
 
     #[test]

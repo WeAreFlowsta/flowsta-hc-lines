@@ -37,14 +37,15 @@ pub struct Facts {
     /// Kinds of data still owed from the previous line (an app's carry not
     /// yet done; the Vault: the web-era signatures).
     pub owed: Vec<String>,
-    /// Rounds that reached a rendezvous since listening began.
-    pub reachable_rounds: u32,
     pub now_ms: u64,
 }
 
 /// How long a restored identity that has heard from no other device keeps
-/// its previous line before it calls itself alone. `None`: forever, which
-/// is what Flowsta Vault 1.7.0 does.
+/// its previous line before it calls itself alone: `alone_after` since the
+/// window began (`Marker::listening_since_ms`) AND `alone_rounds` rounds in
+/// which a previous-line rendezvous answered (`Marker::reachable_rounds`,
+/// counted by [`crate::marker::ListenTally`]). `None`: forever, which is
+/// what Flowsta Vault 1.7.0 does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RetirementPolicy {
     pub alone_after: Option<std::time::Duration>,
@@ -144,7 +145,7 @@ fn sibling_on_previous<'a>(f: &'a Facts, spec: &MarkerSpec) -> Option<&'a Siblin
 /// A restored identity's listen window has closed (its time and rounds).
 fn window_closed(f: &Facts, p: &RetirementPolicy, m: &Marker) -> bool {
     match (p.alone_after, m.listening_since_ms) {
-        (Some(after), Some(since)) => f.now_ms.saturating_sub(since) >= after.as_millis() as u64 && f.reachable_rounds >= p.alone_rounds,
+        (Some(after), Some(since)) => f.now_ms.saturating_sub(since) >= after.as_millis() as u64 && m.reachable_rounds >= p.alone_rounds,
         _ => false,
     }
 }
@@ -199,7 +200,7 @@ mod tests {
     const SPEC: MarkerSpec = MarkerSpec { file_name: "moved-07", old_line_key: "line_06_needed", previous: Line::V06, current: Line::V07 };
 
     fn facts(marker: MarkerRead, siblings: Siblings) -> Facts {
-        Facts { marker, old_line_data_present: true, own_device_id: Some("me".into()), siblings, owed: vec![], reachable_rounds: 0, now_ms: 1_000_000 }
+        Facts { marker, old_line_data_present: true, own_device_id: Some("me".into()), siblings, owed: vec![], now_ms: 1_000_000 }
     }
     /// A marker whose last pass carried everything (unless `edit` says otherwise).
     fn present(edit: impl FnOnce(&mut Marker)) -> MarkerRead {
@@ -249,15 +250,20 @@ mod tests {
     #[test]
     fn a_window_closes_after_its_time_and_rounds() {
         let p = RetirementPolicy { alone_after: Some(std::time::Duration::from_secs(600)), alone_rounds: 3 };
-        let mut f = facts(present(|m| { m.restored = true; m.listening_since_ms = Some(0); }), Siblings::NoneHeardYet);
-        f.now_ms = 599_000;
-        f.reachable_rounds = 5;
-        assert_eq!(old_line_wanted(&f, &p, &SPEC), Decision::Wanted(Why::Listening), "not long enough yet");
-        f.now_ms = 600_000;
-        f.reachable_rounds = 2;
-        assert_eq!(old_line_wanted(&f, &p, &SPEC), Decision::Wanted(Why::Listening), "not enough rounds reached a rendezvous");
-        f.reachable_rounds = 3;
-        assert_eq!(old_line_wanted(&f, &p, &SPEC), Decision::NotWanted(Why::Alone));
+        let listening = |rounds: u32, now_ms| {
+            let mut f = facts(present(|m| { m.restored = true; m.listening_since_ms = Some(0); m.reachable_rounds = rounds; }), Siblings::NoneHeardYet);
+            f.now_ms = now_ms;
+            f
+        };
+        assert_eq!(old_line_wanted(&listening(5, 599_000), &p, &SPEC), Decision::Wanted(Why::Listening), "not long enough yet");
+        assert_eq!(old_line_wanted(&listening(2, 600_000), &p, &SPEC), Decision::Wanted(Why::Listening), "not enough rounds reached a rendezvous");
+        assert_eq!(write_targets(&listening(2, 600_000), &p, true, &SPEC).mirror, Some(Line::V06), "copies while it listens");
+        assert_eq!(old_line_wanted(&listening(3, 600_000), &p, &SPEC), Decision::NotWanted(Why::Alone));
+        assert_eq!(write_targets(&listening(3, 600_000), &p, true, &SPEC).mirror, None, "alone: nobody reads copies there");
+        // No start recorded (restored by a version without one): it listens until a round starts the window.
+        let mut f = listening(30, 10_000_000);
+        if let MarkerRead::Present(m) = &mut f.marker { m.listening_since_ms = None; }
+        assert_eq!(old_line_wanted(&f, &p, &SPEC), Decision::Wanted(Why::Listening));
     }
 
     #[test]

@@ -11,7 +11,7 @@
 //! The file is a JSON object. This module reads and writes the line fields
 //! (`v`, `writes_to`, `moved_at_ms`, `born`, `restored`, the old-line
 //! decision under the key the app names, `listening_since_ms`,
-//! `carried_all_ms`) and keeps
+//! `reachable_rounds`, `carried_all_ms`) and keeps
 //! every other key as it found it, so an app's own fields, and the fields
 //! an older version of the app requires, survive every update.
 
@@ -56,6 +56,9 @@ pub struct Marker {
     pub old_line_needed: Option<bool>,
     /// When a restored identity began listening for other devices.
     pub listening_since_ms: Option<u64>,
+    /// Rounds since then in which a previous-line rendezvous answered and
+    /// still nobody was heard (counted up to the policy's `alone_rounds`).
+    pub reachable_rounds: u32,
     /// When a pass, complete for every kind, began with no other device on
     /// the previous generation: nothing is left there to carry. Cleared by
     /// a pass that finds something left or a device back on it.
@@ -84,6 +87,7 @@ impl Marker {
             restored: false,
             old_line_needed: None,
             listening_since_ms: None,
+            reachable_rounds: 0,
             carried_all_ms: None,
             app: Map::new(),
         }
@@ -130,14 +134,15 @@ impl Marker {
         let restored = flag(take("restored"));
         let old_line_needed = take(spec.old_line_key).and_then(|v| v.as_bool());
         let listening_since_ms = take("listening_since_ms").and_then(|v| v.as_u64());
+        let reachable_rounds = take("reachable_rounds").and_then(|v| v.as_u64()).map(|n| n.min(u32::MAX as u64) as u32).unwrap_or(0);
         let carried_all_ms = take("carried_all_ms").and_then(|v| v.as_u64());
-        Ok(Self { v, writes_to, moved_at_ms, born, restored, old_line_needed, listening_since_ms, carried_all_ms, app: map })
+        Ok(Self { v, writes_to, moved_at_ms, born, restored, old_line_needed, listening_since_ms, reachable_rounds, carried_all_ms, app: map })
     }
 
     /// The JSON object: the app's keys as found, then the line fields. The
     /// old-line key is always written (null when undecided), as earlier
-    /// versions wrote it; `writes_to`, `listening_since_ms` and
-    /// `carried_all_ms` only when set.
+    /// versions wrote it; `writes_to`, `listening_since_ms`,
+    /// `reachable_rounds` and `carried_all_ms` only when set.
     pub fn to_map(&self, spec: &MarkerSpec) -> Map<String, Value> {
         let mut map = self.app.clone();
         map.insert("v".into(), Value::from(self.v));
@@ -151,10 +156,29 @@ impl Marker {
         if let Some(t) = self.listening_since_ms {
             map.insert("listening_since_ms".into(), Value::from(t));
         }
+        if self.reachable_rounds > 0 {
+            map.insert("reachable_rounds".into(), Value::from(self.reachable_rounds));
+        }
         if let Some(t) = self.carried_all_ms {
             map.insert("carried_all_ms".into(), Value::from(t));
         }
         map
+    }
+
+    /// One listening round: the window starts now if it has no start (an
+    /// identity restored by a version without one), and `new_rounds`
+    /// reachable rounds are added, up to `cap`. Whether anything changed.
+    pub fn note_listening(&mut self, now_ms: u64, new_rounds: u32, cap: u32) -> bool {
+        let mut changed = false;
+        if self.listening_since_ms.is_none() {
+            self.listening_since_ms = Some(now_ms);
+            changed = true;
+        }
+        if self.reachable_rounds < cap && new_rounds > 0 {
+            self.reachable_rounds = self.reachable_rounds.saturating_add(new_rounds).min(cap);
+            changed = true;
+        }
+        changed
     }
 
     /// Write it (atomically: the file is never half there).
@@ -176,6 +200,49 @@ pub fn update_marker(root: &Path, spec: &MarkerSpec, change: impl FnOnce(&mut Ma
         }
         MarkerRead::Absent => Err("no marker".into()),
         MarkerRead::Unreadable(e) => Err(format!("the marker does not read: {e}")),
+    }
+}
+
+/// Counts a listening identity's reachable rounds into its marker. The
+/// supervisor counts rounds for its whole life
+/// ([`crate::supervisor::Supervisor::reachable_rounds`]); this keeps the
+/// count it last saw for one identity, so each call adds only the rounds
+/// since. The first call for an identity starts from the count then.
+pub struct ListenTally {
+    seen: std::sync::Mutex<Option<(PathBuf, u64)>>,
+}
+
+impl ListenTally {
+    pub const fn new() -> Self {
+        Self { seen: std::sync::Mutex::new(None) }
+    }
+
+    /// Call each round the decision is `Wanted(Why::Listening)`, with the
+    /// supervisor's count for the previous line and the policy's
+    /// `alone_rounds`. The marker is written only when the round changes it
+    /// (the window's start, or a round under the cap), so at most `cap`
+    /// writes after the first.
+    pub fn note(&self, root: &Path, spec: &MarkerSpec, rounds_now: u64, cap: u32, now_ms: u64) -> Result<(), String> {
+        let new_rounds = {
+            let mut seen = self.seen.lock().unwrap();
+            let before = match seen.as_ref() {
+                Some((r, n)) if r == root && *n <= rounds_now => *n,
+                _ => rounds_now,
+            };
+            *seen = Some((root.to_path_buf(), rounds_now));
+            (rounds_now - before).min(u32::MAX as u64) as u32
+        };
+        let MarkerRead::Present(mut m) = Marker::load(root, spec) else { return Ok(()) };
+        if m.note_listening(now_ms, new_rounds, cap) {
+            m.save(root, spec).map_err(|e| e.to_string())?;
+        }
+        Ok(())
+    }
+}
+
+impl Default for ListenTally {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -272,6 +339,7 @@ mod tests {
         m.born = true;
         m.old_line_needed = Some(false);
         m.listening_since_ms = Some(9);
+        m.reachable_rounds = 4;
         m.carried_all_ms = Some(11);
         m.app.insert("vault_version".into(), Value::from("1.8.0"));
         m.save(&d, &SPEC).unwrap();
@@ -282,8 +350,43 @@ mod tests {
         let mut bare = Marker::new(&SPEC, 5);
         bare.writes_to = None;
         let map = bare.to_map(&SPEC);
-        assert!(!map.contains_key("writes_to") && !map.contains_key("listening_since_ms") && !map.contains_key("carried_all_ms"));
+        assert!(!map.contains_key("writes_to") && !map.contains_key("listening_since_ms") && !map.contains_key("reachable_rounds") && !map.contains_key("carried_all_ms"));
         assert_eq!(map.get("line_06_needed"), Some(&Value::Null), "always written, as 1.7.0 did");
+    }
+
+    #[test]
+    fn listening_starts_the_window_once_and_counts_rounds_up_to_the_cap() {
+        let mut m = Marker::new(&SPEC, 5);
+        assert!(m.note_listening(100, 0, 3), "the window starts");
+        assert!(!m.note_listening(200, 0, 3), "no round reached a rendezvous: nothing to write");
+        assert!(m.note_listening(300, 2, 3));
+        assert!(m.note_listening(400, 5, 3));
+        assert_eq!((m.listening_since_ms, m.reachable_rounds), (Some(100), 3), "started at the first round, capped");
+        assert!(!m.note_listening(500, 1, 3), "at the cap: no more writes");
+    }
+
+    #[test]
+    fn the_tally_adds_only_the_rounds_since_its_last_look() {
+        let d = dir("tally");
+        let mut m = Marker::new(&SPEC, 5);
+        m.restored = true;
+        m.save(&d, &SPEC).unwrap();
+        let tally = ListenTally::new();
+        let read = || match Marker::load(&d, &SPEC) {
+            MarkerRead::Present(m) => (m.listening_since_ms, m.reachable_rounds),
+            other => panic!("{other:?}"),
+        };
+        tally.note(&d, &SPEC, 7, 30, 1_000).unwrap();
+        assert_eq!(read(), (Some(1_000), 0), "the first look starts the window and counts from there");
+        tally.note(&d, &SPEC, 9, 30, 2_000).unwrap();
+        tally.note(&d, &SPEC, 9, 30, 3_000).unwrap();
+        tally.note(&d, &SPEC, 10, 30, 4_000).unwrap();
+        assert_eq!(read(), (Some(1_000), 3));
+        tally.note(&d, &SPEC, 50, 30, 5_000).unwrap();
+        assert_eq!(read().1, 30, "capped");
+        let none = dir("tally-none");
+        tally.note(&none, &SPEC, 60, 30, 6_000).unwrap();
+        assert!(!SPEC.path(&none).exists(), "never creates a marker");
     }
 
     #[test]
