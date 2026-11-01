@@ -314,6 +314,24 @@ impl<C: PassApp> PassRunner<C> {
         Some(PassClaim { root: root.to_path_buf(), running: self.running.clone(), last: self.last.clone() })
     }
 
+    /// Retire the previous line in-session, once the policy no longer
+    /// wants it: between passes, never during one (it holds the claim); the
+    /// line stopped cleanly; the marker records the decision. Returns whether
+    /// it stopped the line (false: a pass is running or a line is not up;
+    /// the next round tries again).
+    pub async fn retire_previous(&self, app: &C, root: &Path, sup: &Arc<crate::supervisor::Supervisor>) -> bool {
+        let Some(_claim) = self.claim(app, root) else { return false };
+        let (sup, line) = (sup.clone(), self.spec.previous);
+        // Blocking: up to the line's stop graces.
+        if tokio::task::spawn_blocking(move || sup.stop_line(line)).await.is_err() {
+            return false;
+        }
+        if let Err(e) = crate::marker::update_marker(root, &self.spec, |m| m.old_line_needed = Some(false)) {
+            log::debug!("[pass] the retirement was not recorded in the marker: {e}");
+        }
+        true
+    }
+
     pub fn status(&self, root: &Path) -> PassStatus {
         PassStatus {
             running: self.running.lock().unwrap().as_deref() == Some(root),
@@ -839,6 +857,25 @@ mod tests {
         assert!(r.run(&app, dir.path(), "t").await.flipped);
         let m = marker_map(dir.path());
         assert_eq!((m["later_version_key"].as_str(), m["notes"].as_u64()), (Some("kept"), Some(0)));
+    }
+
+    #[tokio::test]
+    async fn the_previous_line_retires_between_passes_and_the_marker_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        Marker::new(&SPEC, 1).save(dir.path(), &SPEC).unwrap();
+        let app = app(vec![], vec![]);
+        let r = runner(true, vec![]);
+        let sup = Arc::new(crate::supervisor::Supervisor::new("t"));
+        let claim = r.claim(&app, dir.path()).unwrap();
+        assert!(!r.retire_previous(&app, dir.path(), &sup).await, "never during a pass");
+        drop(claim);
+        assert!(r.retire_previous(&app, dir.path(), &sup).await);
+        assert_eq!(sup.state(Line::V06), crate::supervisor::LineState::Off);
+        match Marker::load(dir.path(), &SPEC) {
+            MarkerRead::Present(m) => assert_eq!(m.old_line_needed, Some(false)),
+            other => panic!("{other:?}"),
+        }
+        assert!(!r.status(dir.path()).running, "the claim is released");
     }
 
     #[test]
