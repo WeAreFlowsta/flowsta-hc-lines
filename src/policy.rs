@@ -2,7 +2,7 @@
 //! start leads with: pure functions of local facts, so every rule is tested
 //! without a conductor and every app decides the same way.
 
-use crate::marker::{MarkerRead, MarkerSpec};
+use crate::marker::{Marker, MarkerRead, MarkerSpec};
 use crate::Line;
 
 /// What the other devices of an identity are, as far as this device knows.
@@ -118,21 +118,12 @@ pub fn old_line_wanted(f: &Facts, p: &RetirementPolicy, spec: &MarkerSpec) -> De
     if let Some(kind) = f.owed.first() {
         return Decision::Wanted(Why::Owed(kind.clone()));
     }
-    let previous = spec.previous.generation();
-    if let Siblings::Heard(list) = &f.siblings {
-        if let Some(s) = list.iter().find(|s| !s.removed && s.generation == previous && Some(&s.device_id) != f.own_device_id.as_ref()) {
-            return Decision::Wanted(Why::SiblingOnOld(s.device_id.clone()));
-        }
+    if let Some(s) = sibling_on_previous(f, spec) {
+        return Decision::Wanted(Why::SiblingOnOld(s.device_id.clone()));
     }
     let listening = matches!(f.siblings, Siblings::NoneHeardYet) && m.restored;
-    if listening {
-        let closed = match (p.alone_after, m.listening_since_ms) {
-            (Some(after), Some(since)) => f.now_ms.saturating_sub(since) >= after.as_millis() as u64 && f.reachable_rounds >= p.alone_rounds,
-            _ => false,
-        };
-        if !closed {
-            return Decision::Wanted(Why::Listening);
-        }
+    if listening && !window_closed(f, p, m) {
+        return Decision::Wanted(Why::Listening);
     }
     if f.old_line_data_present && m.carried_all_ms.is_none() {
         return Decision::Wanted(Why::NotCarried);
@@ -142,6 +133,44 @@ pub fn old_line_wanted(f: &Facts, p: &RetirementPolicy, spec: &MarkerSpec) -> De
         Siblings::NeverShared => Decision::NotWanted(Why::NeverShared),
         _ => Decision::NotWanted(Why::NothingLeft),
     }
+}
+
+/// Another unremoved device (not this one) on the previous generation.
+fn sibling_on_previous<'a>(f: &'a Facts, spec: &MarkerSpec) -> Option<&'a Sibling> {
+    let Siblings::Heard(list) = &f.siblings else { return None };
+    list.iter().find(|s| !s.removed && s.generation == spec.previous.generation() && Some(&s.device_id) != f.own_device_id.as_ref())
+}
+
+/// A restored identity's listen window has closed (its time and rounds).
+fn window_closed(f: &Facts, p: &RetirementPolicy, m: &Marker) -> bool {
+    match (p.alone_after, m.listening_since_ms) {
+        (Some(after), Some(since)) => f.now_ms.saturating_sub(since) >= after.as_millis() as u64 && f.reachable_rounds >= p.alone_rounds,
+        _ => false,
+    }
+}
+
+/// Where a write goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WriteTargets {
+    /// The line the marker says writes go to.
+    pub primary: Line,
+    /// The previous line too, for the devices that read it there.
+    pub mirror: Option<Line>,
+}
+
+/// A write goes to the line the marker says. While that is the current
+/// line, the same write goes to the previous one too only when it runs AND
+/// someone reads it there: another device on the previous generation, or a
+/// restored identity still listening for one. Running for any other reason
+/// (a carry owed, a pass not yet complete), it gets no copies.
+pub fn write_targets(f: &Facts, p: &RetirementPolicy, old_running: bool, spec: &MarkerSpec) -> WriteTargets {
+    let primary = Marker::writes_to(&f.marker, spec);
+    let readers = match &f.marker {
+        MarkerRead::Present(m) => sibling_on_previous(f, spec).is_some() || (m.restored && matches!(f.siblings, Siblings::NoneHeardYet) && !window_closed(f, p, m)),
+        // Unreadable: no listen window to read; a device on the previous generation still counts.
+        _ => sibling_on_previous(f, spec).is_some(),
+    };
+    WriteTargets { primary, mirror: (primary == spec.current && old_running && readers).then_some(spec.previous) }
 }
 
 /// Which line a start leads with, and which it attaches after.
@@ -166,7 +195,6 @@ pub fn plan_start(f: &Facts, p: &RetirementPolicy, spec: &MarkerSpec) -> (StartP
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::marker::Marker;
 
     const SPEC: MarkerSpec = MarkerSpec { file_name: "moved-07", old_line_key: "line_06_needed", previous: Line::V06, current: Line::V07 };
 
@@ -258,6 +286,34 @@ mod tests {
         let p = RetirementPolicy { alone_after: Some(std::time::Duration::from_secs(1)), alone_rounds: 0 };
         let f = not_carried(|m| { m.restored = true; m.listening_since_ms = Some(0); }, Siblings::NoneHeardYet);
         assert_eq!(old_line_wanted(&f, &p, &SPEC), Decision::Wanted(Why::NotCarried));
+    }
+
+    #[test]
+    fn writes_go_to_the_previous_line_too_only_for_someone_who_reads_it_there() {
+        let targets = |f: &Facts, running| write_targets(f, &NEVER, running, &SPEC);
+        // Not moved: writes go to the previous line, and the pass carries them.
+        let f = facts(MarkerRead::Absent, Siblings::Heard(vec![sib("laptop", "holochain-0.6", false)]));
+        assert_eq!(targets(&f, true), WriteTargets { primary: Line::V06, mirror: None });
+        // Moved, a device on the previous generation: both, while that line runs.
+        let f = facts(present(|_| {}), Siblings::Heard(vec![sib("laptop", "holochain-0.6", false)]));
+        assert_eq!(targets(&f, true), WriteTargets { primary: Line::V07, mirror: Some(Line::V06) });
+        assert_eq!(targets(&f, false).mirror, None, "not running: nowhere to write");
+        // Restored and still listening: both.
+        let f = facts(present(|m| { m.restored = true; m.listening_since_ms = Some(0); }), Siblings::NoneHeardYet);
+        assert_eq!(targets(&f, true).mirror, Some(Line::V06));
+        // Running for a carry owed or a pass not yet complete, nobody on it: no copies.
+        let mut f = facts(present(|m| m.carried_all_ms = None), Siblings::Heard(vec![sib("phone", "holochain-0.7", false), sib("old", "holochain-0.6", true)]));
+        f.owed = vec!["web_era".into()];
+        assert!(old_line_wanted(&f, &NEVER, &SPEC).wanted());
+        assert_eq!(targets(&f, true).mirror, None);
+        // Owed AND a device on it: the device still gets them.
+        let mut f = facts(present(|_| {}), Siblings::Heard(vec![sib("laptop", "holochain-0.6", false)]));
+        f.owed = vec!["web_era".into()];
+        assert_eq!(old_line_wanted(&f, &NEVER, &SPEC), Decision::Wanted(Why::Owed("web_era".into())));
+        assert_eq!(targets(&f, true).mirror, Some(Line::V06));
+        // An unreadable marker: writes to the current line; a device on the previous one still gets copies.
+        let f = facts(MarkerRead::Unreadable("x".into()), Siblings::Heard(vec![sib("laptop", "holochain-0.6", false)]));
+        assert_eq!(targets(&f, true), WriteTargets { primary: Line::V07, mirror: Some(Line::V06) });
     }
 
     #[test]
