@@ -22,6 +22,7 @@ mod error;
 pub mod files;
 pub mod keeper;
 pub mod keystore;
+pub mod kit;
 pub mod marker;
 pub mod pass;
 pub mod policy;

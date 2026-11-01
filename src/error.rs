@@ -20,6 +20,8 @@ pub enum Error {
     /// A zome call failed; its kind says what a caller can do about it.
     #[error(transparent)]
     ZomeCall(#[from] crate::client::ZomeCallError),
+    #[error(transparent)]
+    Kit(#[from] crate::kit::KitError),
     /// The call needs a line this build does not include (its feature is off).
     #[error("Holochain line {0} is not compiled into this build")]
     LineNotCompiled(Line),
