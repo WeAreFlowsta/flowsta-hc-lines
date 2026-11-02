@@ -503,6 +503,11 @@ impl Supervisor {
         self.current.lock().unwrap().lines[slot(line)].as_ref().map(|l| (l.admin_port(), l.app_port))
     }
 
+    /// The process id of `line`'s conductor; None without that line.
+    pub fn conductor_pid(&self, line: Line) -> Option<u32> {
+        self.current.lock().unwrap().lines[slot(line)].as_ref().map(|l| l.process.conductor.id())
+    }
+
     /// Whether `line`'s conductor still runs; None without that line.
     pub fn alive(&self, line: Line) -> Option<bool> {
         self.current.lock().unwrap().lines[slot(line)].as_mut().map(|l| l.process.conductor_alive())

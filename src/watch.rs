@@ -116,6 +116,46 @@ impl Default for Watchdog {
     }
 }
 
+/// When a conductor is restarted for its memory. Holochain 0.7.1 keeps the
+/// machine code of every module it reloads until the conductor restarts
+/// (holochain#6064): a conductor grows after an install, and with every hour
+/// one of its zomes sits idle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemoryPolicy {
+    /// Restart above this resident size.
+    pub over_bytes: u64,
+    /// Not before the conductor has run this long: its first minutes compile
+    /// what it uses, and a restart after that gives back the most.
+    pub min_uptime: Duration,
+    /// At most once in this long.
+    pub min_gap: Duration,
+}
+
+/// A conductor's resident memory and how long its process has run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ConductorMemory {
+    pub resident_bytes: u64,
+    pub running: Duration,
+}
+
+/// Read a conductor's memory from the OS (Linux, macOS and Windows); None
+/// when the process is gone.
+pub fn conductor_memory(pid: u32) -> Option<ConductorMemory> {
+    use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+    let pid = Pid::from_u32(pid);
+    let mut sys = System::new();
+    sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[pid]), true, ProcessRefreshKind::nothing().with_memory());
+    let p = sys.process(pid)?;
+    Some(ConductorMemory { resident_bytes: p.memory(), running: Duration::from_secs(p.run_time()) })
+}
+
+/// Whether to restart a conductor for its memory now: over the size, run
+/// long enough, not restarted for its memory within the gap, and the app
+/// quiet (the app says what quiet means: nothing asked of it just now).
+pub fn memory_restart_due(m: &ConductorMemory, last_memory_restart: Option<Duration>, quiet: bool, p: &MemoryPolicy) -> bool {
+    m.resident_bytes > p.over_bytes && m.running >= p.min_uptime && last_memory_restart.is_none_or(|ago| ago >= p.min_gap) && quiet
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,6 +164,28 @@ mod tests {
 
     fn lines(primary: Option<Line>, v06: Option<bool>, v07: Option<bool>) -> LinesNow {
         LinesNow { primary, v06, v07 }
+    }
+
+    #[test]
+    fn a_conductor_is_restarted_for_its_memory_only_when_over_settled_due_and_quiet() {
+        let p = MemoryPolicy { over_bytes: 1 << 30, min_uptime: Duration::from_secs(20 * 60), min_gap: Duration::from_secs(6 * 3600) };
+        let gb = |x: f64| (x * (1u64 << 30) as f64) as u64;
+        let m = |size: u64, mins: u64| ConductorMemory { resident_bytes: size, running: Duration::from_secs(mins * 60) };
+        // After an install (~1.2 GB), once its first minutes are over.
+        assert!(memory_restart_due(&m(gb(1.2), 25), None, true, &p));
+        assert!(!memory_restart_due(&m(gb(1.2), 10), None, true, &p), "too soon after the start");
+        assert!(!memory_restart_due(&m(gb(0.6), 600), None, true, &p), "under the size");
+        assert!(!memory_restart_due(&m(gb(1.2), 25), None, false, &p), "the app is busy");
+        assert!(!memory_restart_due(&m(gb(1.5), 300), Some(Duration::from_secs(3600)), true, &p), "restarted an hour ago");
+        assert!(memory_restart_due(&m(gb(1.5), 300), Some(Duration::from_secs(7 * 3600)), true, &p));
+    }
+
+    /// This process: some memory, running.
+    #[test]
+    fn a_running_process_memory_is_read() {
+        let m = conductor_memory(std::process::id()).expect("this process");
+        assert!(m.resident_bytes > 0);
+        assert!(conductor_memory(u32::MAX - 7).is_none());
     }
 
     #[test]
