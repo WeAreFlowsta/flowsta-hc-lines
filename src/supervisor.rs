@@ -569,6 +569,26 @@ pub enum Role {
     Secondary,
 }
 
+/// What a line's [`LineHooks::setup`] did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Setup {
+    /// The app interface's port.
+    pub app_port: u16,
+    /// Restart the line once before it joins. Holochain 0.7.1 keeps the
+    /// memory an install used until its conductor restarts: every module it
+    /// drops from its cache (after each new cell's genesis, and after an
+    /// hour idle) is reloaded into one runtime engine that keeps the old
+    /// copy's machine code. A new identity's 0.7 conductor held ~2 GB after
+    /// installing three apps, 419 MB after one restart (11-03).
+    pub restart: bool,
+}
+
+impl From<u16> for Setup {
+    fn from(app_port: u16) -> Self {
+        Setup { app_port, restart: false }
+    }
+}
+
 /// What an app supplies for its lines; the supervisor runs the order.
 #[async_trait::async_trait]
 pub trait LineHooks: Send + Sync + 'static {
@@ -576,8 +596,10 @@ pub trait LineHooks: Send + Sync + 'static {
     /// and the app's settings for that line.
     async fn start(&self, line: Line, role: Role) -> std::result::Result<LineProcess, String>;
     /// Install the app's DNAs on a line that just came up and attach its app
-    /// interface; returns the app port. A failure stops the line.
-    async fn setup(&self, line: Line, role: Role, process: &mut LineProcess) -> std::result::Result<u16, String>;
+    /// interface; returns the app port (`port.into()`), or asks for one
+    /// restart before the line joins ([`Setup::restart`]: the second setup
+    /// is the one that counts). A failure stops the line.
+    async fn setup(&self, line: Line, role: Role, process: &mut LineProcess) -> std::result::Result<Setup, String>;
     /// The primary line failed once; prepare the one retry (for example,
     /// set aside a key store that will not open). Default: retry as it is.
     async fn before_retry(&self, _line: Line, _error: &str) {}
@@ -590,17 +612,29 @@ pub trait LineHooks: Send + Sync + 'static {
     async fn secondary_late(&self, _line: Line) {}
 }
 
-/// Start and set up one line; a setup failure stops what was started.
+/// Start and set up one line, restarted once when its setup asks
+/// ([`Setup::restart`]); a setup failure stops what was started.
 async fn start_and_setup(hooks: &dyn LineHooks, line: Line, role: Role) -> std::result::Result<RunningLine, String> {
-    let mut process = hooks.start(line, role).await?;
-    match hooks.setup(line, role, &mut process).await {
-        Ok(app_port) => Ok(RunningLine { process, app_port }),
-        Err(e) => {
-            let _ = tokio::task::spawn_blocking(move || {
-                process.stop();
-            })
-            .await;
-            Err(e)
+    let mut restarted = false;
+    loop {
+        let mut process = hooks.start(line, role).await?;
+        match hooks.setup(line, role, &mut process).await {
+            Ok(setup) if setup.restart && !restarted => {
+                log::info!("[{line}] apps installed this start: restarting the line once to give back the memory the install kept");
+                let _ = tokio::task::spawn_blocking(move || {
+                    process.stop();
+                })
+                .await;
+                restarted = true;
+            }
+            Ok(setup) => return Ok(RunningLine { process, app_port: setup.app_port }),
+            Err(e) => {
+                let _ = tokio::task::spawn_blocking(move || {
+                    process.stop();
+                })
+                .await;
+                return Err(e);
+            }
         }
     }
 }
@@ -885,6 +919,8 @@ mod order_tests {
     struct Fake {
         fail_starts: Mutex<Vec<(Line, u32)>>,
         fail_setup: Mutex<Vec<Line>>,
+        /// Setups that ask for a restart (every time).
+        restart_setup: Mutex<Vec<Line>>,
         secondary_delay_ms: u64,
         starts: AtomicU32,
         retries: AtomicU32,
@@ -920,11 +956,12 @@ mod order_tests {
                 timeouts: Timeouts::default(),
             })
         }
-        async fn setup(&self, line: Line, _role: Role, process: &mut LineProcess) -> std::result::Result<u16, String> {
+        async fn setup(&self, line: Line, _role: Role, process: &mut LineProcess) -> std::result::Result<Setup, String> {
             if self.fail_setup.lock().unwrap().contains(&line) {
                 return Err("setup failed".into());
             }
-            Ok(process.admin_port + 100)
+            let restart = self.restart_setup.lock().unwrap().contains(&line);
+            Ok(Setup { app_port: process.admin_port + 100, restart })
         }
         async fn before_retry(&self, _line: Line, _error: &str) {
             self.retries.fetch_add(1, Ordering::SeqCst);
@@ -975,6 +1012,21 @@ mod order_tests {
         assert_eq!(sup.session(), None, "no session without a primary");
         let setup_fails = Arc::new(Fake { fail_setup: Mutex::new(vec![Line::V07]), ..Fake::default() });
         assert_eq!(sup.start_lines(Line::V07, None, setup_fails).await.unwrap_err(), "setup failed");
+    }
+
+    /// A setup that installed apps asks for a restart: the line starts
+    /// twice, joins once with the second setup's port, and is never
+    /// restarted a second time, even when that setup asks again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_setup_that_asks_restarts_the_line_once() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let hooks = Arc::new(Fake { restart_setup: Mutex::new(vec![Line::V07]), ..Fake::default() });
+        sup.start_lines(Line::V07, Some(Line::V06), hooks.clone()).await.unwrap();
+        wait_for(|| sup.has(Line::V06)).await;
+        assert_eq!(hooks.starts.load(Ordering::SeqCst), 3, "0.7 twice, 0.6 once");
+        assert_eq!(*hooks.events.lock().unwrap(), ["joined 0.7 Primary 2/102", "joined 0.6 Secondary 1/101"]);
+        assert_eq!(sup.state(Line::V07), LineState::Serving);
+        sup.stop();
     }
 
     #[tokio::test(flavor = "multi_thread")]
