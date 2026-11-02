@@ -79,7 +79,7 @@ pub fn decide(f: &Facts) -> Outcome {
         // file nothing is set.
         None => Outcome::Skipped("Mesa's EGL vendor file is not installed"),
         // Mesa's EGL alone aborts on an NVIDIA-only machine; beside another
-        // GPU the GBM switch is what swaps the colours.
+        // GPU the GBM switch is what swaps the colors.
         Some(p) => Outcome::Applied { mesa_vendor_file: p.clone(), gbm_off: !f.other_gpu },
     }
 }
