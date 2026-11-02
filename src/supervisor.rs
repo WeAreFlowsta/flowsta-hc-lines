@@ -6,7 +6,7 @@
 
 use crate::conductor::{self, NetworkTuning};
 use crate::keystore::{self, SocketPlan};
-use crate::process::{stop_gracefully, SidecarChild, StopOutcome};
+use crate::process::{stop_gracefully, SidecarChild, StopOutcome, StopRequest};
 use crate::rendezvous::Rendezvous;
 use crate::{Error, Line, Result};
 use std::path::{Path, PathBuf};
@@ -114,13 +114,14 @@ impl LineProcess {
 
     /// Stop the conductor, then the key store: each asked first and killed
     /// only after its grace. A conductor killed in the middle of a write is
-    /// what this avoids (measured: both lines' conductors exit about 0.1 s
-    /// after the request, lair in under 10 ms).
+    /// what this avoids. The conductor is asked with SIGINT, the one signal
+    /// it shuts down on (with SIGTERM both lines' conductors ended about
+    /// 0.1 s after the request, without their shutdown); lair in under 10 ms.
     pub fn stop(&mut self) -> StopReport {
         let line = self.line;
         let report = StopReport {
-            conductor: stop_gracefully(&mut self.conductor, self.timeouts.conductor_stop),
-            lair: stop_gracefully(&mut self.lair, self.timeouts.lair_stop),
+            conductor: stop_gracefully(&mut self.conductor, StopRequest::Interrupt, self.timeouts.conductor_stop),
+            lair: stop_gracefully(&mut self.lair, StopRequest::Terminate, self.timeouts.lair_stop),
         };
         for (what, outcome, grace) in [
             ("conductor", &report.conductor, self.timeouts.conductor_stop),
@@ -136,8 +137,8 @@ impl LineProcess {
     }
 }
 
-fn stop_child(child: &mut SidecarChild, grace: Duration) {
-    let _ = stop_gracefully(child, grace);
+fn stop_child(child: &mut SidecarChild, request: StopRequest, grace: Duration) {
+    let _ = stop_gracefully(child, request, grace);
 }
 
 /// Connect to the key store just started and ensure each of `s.agents`,
@@ -184,7 +185,7 @@ pub async fn start_line(s: &LineStart<'_>, mut on_step: impl FnMut(StartStep) + 
     let agents = match lair_up {
         Ok(a) => a,
         Err(e) => {
-            stop_child(&mut lair, s.timeouts.lair_stop);
+            stop_child(&mut lair, StopRequest::Terminate, s.timeouts.lair_stop);
             return Err(e);
         }
     };
@@ -208,15 +209,15 @@ pub async fn start_line(s: &LineStart<'_>, mut on_step: impl FnMut(StartStep) + 
     let (admin_port, mut conductor) = match conductor_up {
         Ok(v) => v,
         Err(e) => {
-            stop_child(&mut lair, s.timeouts.lair_stop);
+            stop_child(&mut lair, StopRequest::Terminate, s.timeouts.lair_stop);
             return Err(e);
         }
     };
 
     on_step(StartStep::WaitAdmin);
     if let Err(e) = conductor::wait_admin(admin_port, s.timeouts.admin, &mut conductor, s.conductor_dir).await {
-        stop_child(&mut conductor, s.timeouts.conductor_stop);
-        stop_child(&mut lair, s.timeouts.lair_stop);
+        stop_child(&mut conductor, StopRequest::Interrupt, s.timeouts.conductor_stop);
+        stop_child(&mut lair, StopRequest::Terminate, s.timeouts.lair_stop);
         return Err(e);
     }
     log::info!("[{}] key store and conductor up (admin port {admin_port})", s.line);

@@ -301,7 +301,7 @@ fn a_copy_too_deep_for_a_socket_gets_its_runtime_socket() {
 #[tokio::test]
 #[ignore]
 async fn live_a_copied_06_store_signs_identically_on_07() {
-    use crate::process::stop_gracefully;
+    use crate::process::{stop_gracefully, StopRequest};
     let bin = |var: &str| PathBuf::from(std::env::var(var).unwrap_or_else(|_| panic!("set {var}")));
     let (lair06, lair07) = (bin("HC_LINES_LAIR_06"), bin("HC_LINES_LAIR_07"));
     let tmp = tempfile::tempdir().unwrap();
@@ -324,7 +324,7 @@ async fn live_a_copied_06_store_signs_identically_on_07() {
     drop(client);
     let refused = copy_store(&from, &to, &plan()).unwrap_err();
     assert!(matches!(refused, Error::KeyStore(KeyStoreError::SourceRunning(_))), "{refused}");
-    stop_gracefully(&mut child, Duration::from_secs(2)).unwrap();
+    stop_gracefully(&mut child, StopRequest::Terminate, Duration::from_secs(2)).unwrap();
     let before: Vec<_> = STORE_FILES.iter().map(|f| std::fs::read(from.join(f)).ok()).collect();
 
     let copied = copy_store(&from, &to, &plan()).unwrap();
@@ -342,7 +342,7 @@ async fn live_a_copied_06_store_signs_identically_on_07() {
     }
     let fresh = v07::new_seed(&c07, "ai-made-on-07").await.unwrap();
     drop(c07);
-    stop_gracefully(&mut child07, Duration::from_secs(2)).unwrap();
+    stop_gracefully(&mut child07, StopRequest::Terminate, Duration::from_secs(2)).unwrap();
 
     let after: Vec<_> = STORE_FILES.iter().map(|f| std::fs::read(from.join(f)).ok()).collect();
     assert_eq!(before, after, "the original store is byte for byte as it was");
@@ -354,5 +354,5 @@ async fn live_a_copied_06_store_signs_identically_on_07() {
     assert!(matches!(absent, Error::KeyStore(KeyStoreError::KeyAbsent { .. })), "{absent}");
     assert_ne!(fresh, ai1);
     drop(client);
-    stop_gracefully(&mut child, Duration::from_secs(2)).unwrap();
+    stop_gracefully(&mut child, StopRequest::Terminate, Duration::from_secs(2)).unwrap();
 }
