@@ -2,11 +2,16 @@
 //! page change when NVIDIA's EGL draws the window (Linux, the NVIDIA driver
 //! loaded; seen in three apps and in WebKit's own MiniBrowser, 2026-10).
 //!
-//! The fix is a pair of environment variables set before the webview
-//! starts: Mesa's EGL vendor file, and WebKit's GBM path off. Mesa's EGL
-//! alone aborts at startup on a machine whose only GPU is NVIDIA ("Could not
-//! create GBM EGL display"); the pair works on NVIDIA-only machines, Optimus
-//! laptops and machines without NVIDIA alike.
+//! The fix is Mesa's EGL vendor file, set before the webview starts, so
+//! WebKit does not draw through NVIDIA's EGL:
+//!
+//! - beside another GPU (an Intel or AMD laptop GPU, as on Optimus laptops)
+//!   Mesa's EGL alone: WebKit draws on that GPU. Adding the GBM switch there
+//!   swaps red and blue on X11 (found 2026-11-02 on an Optimus laptop: the
+//!   whole app showed brown on XWayland), so it is left alone;
+//! - on a machine whose only GPU is NVIDIA, Mesa's EGL alone aborts at
+//!   startup ("Could not create GBM EGL display"), so WebKit's GBM path is
+//!   switched off too: the pair is the only setup that drew there.
 //!
 //! Call [`apply`] first thing in `main`, before any thread starts (it sets
 //! process environment variables). Nothing is set when the person set either
@@ -35,6 +40,9 @@ pub const MESA_VENDOR_FILES: &[&str] = &[
 pub struct Facts {
     /// The NVIDIA kernel driver is loaded.
     pub nvidia_loaded: bool,
+    /// A GPU driven by another driver is present (a render node whose driver
+    /// is not `nvidia`: Intel or AMD beside NVIDIA, as on Optimus laptops).
+    pub other_gpu: bool,
     /// The person set [`EGL_VENDOR_VAR`] themselves.
     pub egl_vendor_set: bool,
     /// The person set [`DISABLE_GBM_VAR`] themselves.
@@ -48,8 +56,9 @@ pub struct Facts {
 /// What [`apply`] did, for the app to log once its logger is up.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Outcome {
-    /// Both variables set.
-    Applied { mesa_vendor_file: PathBuf },
+    /// Mesa's EGL set, and WebKit's GBM path switched off when `gbm_off`
+    /// (an NVIDIA-only machine).
+    Applied { mesa_vendor_file: PathBuf, gbm_off: bool },
     /// Nothing set, and why.
     Skipped(&'static str),
 }
@@ -66,10 +75,12 @@ pub fn decide(f: &Facts) -> Outcome {
         return Outcome::Skipped("the EGL or WebKit renderer variables are already set");
     }
     match &f.mesa_vendor_file {
-        // Never one variable without the other: Mesa's EGL alone aborts on an
-        // NVIDIA-only machine, and GBM off alone does not avoid the crash.
+        // GBM off alone does not avoid the crash, so without Mesa's vendor
+        // file nothing is set.
         None => Outcome::Skipped("Mesa's EGL vendor file is not installed"),
-        Some(p) => Outcome::Applied { mesa_vendor_file: p.clone() },
+        // Mesa's EGL alone aborts on an NVIDIA-only machine; beside another
+        // GPU the GBM switch is what swaps the colours.
+        Some(p) => Outcome::Applied { mesa_vendor_file: p.clone(), gbm_off: !f.other_gpu },
     }
 }
 
@@ -89,16 +100,21 @@ pub fn apply() -> Outcome {
         use std::path::Path;
         let facts = Facts {
             nvidia_loaded: Path::new("/proc/driver/nvidia/version").exists() || Path::new("/sys/module/nvidia").exists(),
+            other_gpu: other_gpu_present(),
             egl_vendor_set: std::env::var_os(EGL_VENDOR_VAR).is_some(),
             disable_gbm_set: std::env::var_os(DISABLE_GBM_VAR).is_some(),
             opted_out: std::env::var_os(OPT_OUT_VAR).as_deref() == Some(std::ffi::OsStr::new("0")),
             mesa_vendor_file: MESA_VENDOR_FILES.iter().map(PathBuf::from).find(|p| p.is_file()),
         };
         let outcome = decide(&facts);
-        if let Outcome::Applied { mesa_vendor_file } = &outcome {
+        if let Outcome::Applied { mesa_vendor_file, gbm_off } = &outcome {
             std::env::set_var(EGL_VENDOR_VAR, mesa_vendor_file.as_os_str());
-            std::env::set_var(DISABLE_GBM_VAR, "1");
-            let _ = SET_HERE.set(vec![EGL_VENDOR_VAR, DISABLE_GBM_VAR]);
+            if *gbm_off {
+                std::env::set_var(DISABLE_GBM_VAR, "1");
+                let _ = SET_HERE.set(vec![EGL_VENDOR_VAR, DISABLE_GBM_VAR]);
+            } else {
+                let _ = SET_HERE.set(vec![EGL_VENDOR_VAR]);
+            }
         }
         outcome
     }
@@ -106,6 +122,19 @@ pub fn apply() -> Outcome {
     {
         Outcome::Skipped("not Linux")
     }
+}
+
+/// Whether a render node is driven by something other than `nvidia`.
+#[cfg(target_os = "linux")]
+fn other_gpu_present() -> bool {
+    let Ok(entries) = std::fs::read_dir("/sys/class/drm") else { return false };
+    entries.flatten().any(|e| {
+        e.file_name().to_string_lossy().starts_with("renderD")
+            && std::fs::read_link(e.path().join("device/driver"))
+                .ok()
+                .and_then(|d| d.file_name().map(|n| n.to_string_lossy() != "nvidia"))
+                .unwrap_or(false)
+    })
 }
 
 #[cfg(test)]
@@ -117,8 +146,17 @@ mod tests {
     }
 
     #[test]
-    fn applies_with_nvidia_and_mesa() {
-        assert_eq!(decide(&nvidia()), Outcome::Applied { mesa_vendor_file: PathBuf::from(MESA_VENDOR_FILES[0]) });
+    fn nvidia_only_gets_the_pair() {
+        assert_eq!(decide(&nvidia()), Outcome::Applied { mesa_vendor_file: PathBuf::from(MESA_VENDOR_FILES[0]), gbm_off: true });
+    }
+
+    #[test]
+    fn beside_another_gpu_mesa_alone() {
+        // The GBM switch beside another GPU swaps red and blue on X11.
+        assert_eq!(
+            decide(&Facts { other_gpu: true, ..nvidia() }),
+            Outcome::Applied { mesa_vendor_file: PathBuf::from(MESA_VENDOR_FILES[0]), gbm_off: false }
+        );
     }
 
     #[test]
@@ -138,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn never_half_the_pair() {
+    fn never_gbm_off_alone() {
         // Without Mesa's vendor file nothing is set, not even GBM off.
         assert!(matches!(decide(&Facts { mesa_vendor_file: None, ..nvidia() }), Outcome::Skipped(_)));
     }
