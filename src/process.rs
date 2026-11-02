@@ -198,20 +198,37 @@ pub enum StopOutcome {
     Killed,
 }
 
-/// Stop a sidecar cleanly: ask it to exit (SIGTERM on Unix), wait up to
-/// `grace`, then kill it, and reap it either way. A hard kill on every quit
-/// is what left lair's `pid_file` empty after a power cut, and what an
-/// updater must not do to a conductor in the middle of writing. Windows has
-/// no polite request yet (a console control event or closing stdin is still
-/// to be tested), so it kills as before.
-pub fn stop_gracefully(child: &mut SidecarChild, grace: std::time::Duration) -> io::Result<StopOutcome> {
+/// How a sidecar is asked to exit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopRequest {
+    /// SIGINT on Unix: what a Holochain conductor shuts down on (both lines
+    /// wait on `tokio::signal::ctrl_c` and then run `conductor.shutdown()`).
+    /// A SIGTERM ends a conductor at once, exit 143, without that path.
+    Interrupt,
+    /// SIGTERM on Unix: for lair, which has no handler for either and ends
+    /// on SIGTERM even where SIGINT was inherited as ignored (a process a
+    /// script started in the background).
+    Terminate,
+}
+
+/// Stop a sidecar cleanly: ask it to exit (`request`), wait up to `grace`,
+/// then kill it, and reap it either way. A hard kill on every quit is what
+/// left lair's `pid_file` empty after a power cut, and what an updater must
+/// not do to a conductor in the middle of writing. Windows has no polite
+/// request yet (a console control event is still to be tested), so it
+/// kills as before.
+pub fn stop_gracefully(child: &mut SidecarChild, request: StopRequest, grace: std::time::Duration) -> io::Result<StopOutcome> {
     if child.try_wait()?.is_some() {
         return Ok(StopOutcome::AlreadyExited);
     }
     #[cfg(unix)]
     {
+        let signal = match request {
+            StopRequest::Interrupt => libc::SIGINT,
+            StopRequest::Terminate => libc::SIGTERM,
+        };
         // SAFETY: a signal to one pid this process spawned and has not reaped.
-        let rc = unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+        let rc = unsafe { libc::kill(child.id() as i32, signal) };
         if rc == 0 {
             let until = std::time::Instant::now() + grace;
             while std::time::Instant::now() < until {
@@ -223,7 +240,7 @@ pub fn stop_gracefully(child: &mut SidecarChild, grace: std::time::Duration) -> 
         }
     }
     #[cfg(not(unix))]
-    let _ = grace;
+    let _ = (request, grace);
     if child.try_wait()?.is_some() {
         return Ok(StopOutcome::Exited);
     }
@@ -1081,7 +1098,18 @@ mod tests {
             let mut c = sh("sleep 30");
             assert!(pid_alive(c.id()));
             let t = Instant::now();
-            assert_eq!(stop_gracefully(&mut c, Duration::from_secs(5)).unwrap(), StopOutcome::Exited);
+            assert_eq!(stop_gracefully(&mut c, StopRequest::Terminate, Duration::from_secs(5)).unwrap(), StopOutcome::Exited);
+            assert!(t.elapsed() < Duration::from_secs(4));
+        }
+
+        /// A conductor is asked with SIGINT: a child that traps only that
+        /// exits on it, before the grace.
+        #[test]
+        fn an_interrupt_request_sends_sigint() {
+            let mut c = sh("trap 'exit 0' INT; trap '' TERM; while :; do sleep 0.1; done");
+            std::thread::sleep(Duration::from_millis(200));
+            let t = Instant::now();
+            assert_eq!(stop_gracefully(&mut c, StopRequest::Interrupt, Duration::from_secs(5)).unwrap(), StopOutcome::Exited);
             assert!(t.elapsed() < Duration::from_secs(4));
         }
 
@@ -1090,7 +1118,7 @@ mod tests {
             let mut c = sh("trap '' TERM; while :; do sleep 1; done");
             std::thread::sleep(Duration::from_millis(200));
             let t = Instant::now();
-            assert_eq!(stop_gracefully(&mut c, Duration::from_millis(600)).unwrap(), StopOutcome::Killed);
+            assert_eq!(stop_gracefully(&mut c, StopRequest::Terminate, Duration::from_millis(600)).unwrap(), StopOutcome::Killed);
             assert!(t.elapsed() >= Duration::from_millis(600));
             assert!(c.try_wait().unwrap().is_some(), "reaped");
         }
@@ -1099,7 +1127,7 @@ mod tests {
         fn a_child_already_gone_is_reported_so() {
             let mut c = sh("exit 0");
             std::thread::sleep(Duration::from_millis(300));
-            assert_eq!(stop_gracefully(&mut c, Duration::from_secs(1)).unwrap(), StopOutcome::AlreadyExited);
+            assert_eq!(stop_gracefully(&mut c, StopRequest::Terminate, Duration::from_secs(1)).unwrap(), StopOutcome::AlreadyExited);
             assert!(!pid_alive(c.id()));
         }
     }
