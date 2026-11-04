@@ -1043,8 +1043,10 @@ mod session_tests {
     #[test]
     fn a_retirement_waits_for_the_calls_in_flight_then_stops_the_line() {
         let sup = Supervisor::new("t");
-        // (The fake conductor ignores SIGINT, so each stop takes its whole
-        // grace: a short one here.)
+        // (A stop takes up to its grace, a short one here: all of it where
+        // /bin/sh waits on its sleep child and SIGINT ends neither (dash),
+        // almost none where the shell execs sleep (macOS). So the checks
+        // below count the call and the drain, not the stop.)
         let quick = |line: Line, port: u16| {
             let mut r = running(line, port);
             r.process.timeouts.conductor_stop = Duration::from_millis(200);
@@ -1055,15 +1057,17 @@ mod session_tests {
         assert!(sup.attach(session, quick(Line::V06, 12)).is_ok());
 
         // A call on the line finishes 300 ms in: the retirement waits for it.
+        // (The clock starts before the call's thread, so the call ends at
+        // least 300 ms after it.)
+        let t = Instant::now();
         let call = crate::client::calling(Line::V06);
         let ending = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             drop(call);
         });
-        let t = Instant::now();
         sup.retire_line(Line::V06, Duration::from_secs(5));
         ending.join().unwrap();
-        assert!(t.elapsed() >= Duration::from_millis(500), "{:?}", t.elapsed());
+        assert!(t.elapsed() >= Duration::from_millis(300), "{:?}", t.elapsed());
         assert!(t.elapsed() < Duration::from_secs(3), "waited for the call, not the drain: {:?}", t.elapsed());
         assert_eq!((sup.ports(Line::V06), sup.state(Line::V06)), (None, LineState::Off));
         assert_eq!(sup.ports(Line::V07), Some((11, 111)), "the session goes on");
@@ -1073,7 +1077,7 @@ mod session_tests {
         let stuck = crate::client::calling(Line::V06);
         let t = Instant::now();
         sup.retire_line(Line::V06, Duration::from_millis(400));
-        assert!((Duration::from_millis(600)..Duration::from_secs(3)).contains(&t.elapsed()), "{:?}", t.elapsed());
+        assert!((Duration::from_millis(400)..Duration::from_secs(3)).contains(&t.elapsed()), "{:?}", t.elapsed());
         assert_eq!(sup.ports(Line::V06), None);
         drop(stuck);
         assert_eq!(crate::client::in_flight(Line::V06), 0);
