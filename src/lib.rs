@@ -7,8 +7,8 @@
 //! data across, keeps both in step while another of their devices is still
 //! on the old version, and retires the old line once nothing needs it.
 //!
-//! **Status: early.** The machinery is being extracted from Flowsta Vault,
-//! where it runs in production; the public interface is not stable yet.
+//! **Status: before 1.0.** Flowsta Vault runs both its lines on this
+//! library. The public interface still changes until 1.0.
 //!
 //! Each line is a Cargo feature (`line-06`, `line-07`) that pins the exact
 //! client crate versions its conductor needs. Use those crates through the

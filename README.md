@@ -12,7 +12,7 @@ A Holochain *line* is a series of releases that share a network and data format:
 
 ## Status
 
-**Early.** The machinery runs in production in [Flowsta Vault](https://flowsta.com/vault), which moved its users from Holochain 0.6.1 to 0.7.1, and is being extracted into this library. The public interface is not stable yet; expect breaking changes until 1.0.
+**Before 1.0.** This machinery moved [Flowsta Vault](https://flowsta.com/vault)'s users from Holochain 0.6.1 to 0.7.1 in Vault 1.7.0. Since Vault 1.8.0 (in beta), the Vault runs both its lines on this library, and [ProofPoll](https://github.com/WeAreFlowsta/ProofPoll) 0.6.0 (in beta) uses its kit cache. The public interface still changes; expect breaking changes until 1.0, which comes once Flowsta's apps have shipped stable releases built on it.
 
 ## Lines are features
 
