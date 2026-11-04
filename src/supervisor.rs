@@ -117,13 +117,16 @@ impl LineProcess {
     /// what this avoids. The conductor is asked with SIGINT, the one signal
     /// it shuts down on (with SIGTERM both lines' conductors ended about
     /// 0.1 s after the request, without their shutdown); lair in under 10 ms.
+    ///
+    /// A conductor with its network up often outlasts its grace whatever the
+    /// grace: Holochain 0.6.1 and 0.7.1 stop every managed task (the
+    /// workflows that write) within a millisecond of SIGINT, then leave
+    /// their network running, so the process does not exit by itself
+    /// (holochain#6010, fixed after 0.7.1). Traced on a 0.6.1 conductor: all
+    /// 28 managed tasks done 1 ms after the signal, gossip still running
+    /// 25 s later, killed at a 30 s grace. A longer grace only waits longer.
     pub fn stop(&mut self) -> StopReport {
-        self.stop_within(self.timeouts.conductor_stop, self.timeouts.lair_stop)
-    }
-
-    /// [`LineProcess::stop`] with other graces than the line's own.
-    pub fn stop_within(&mut self, conductor_grace: Duration, lair_grace: Duration) -> StopReport {
-        let line = self.line;
+        let (line, conductor_grace, lair_grace) = (self.line, self.timeouts.conductor_stop, self.timeouts.lair_stop);
         let report = StopReport {
             conductor: stop_gracefully(&mut self.conductor, StopRequest::Interrupt, conductor_grace),
             lair: stop_gracefully(&mut self.lair, StopRequest::Terminate, lair_grace),
@@ -133,6 +136,9 @@ impl LineProcess {
             ("key store", &report.lair, lair_grace),
         ] {
             match outcome {
+                Ok(StopOutcome::Killed) if what == "conductor" => log::info!(
+                    "[{line}] the conductor was asked to stop and was ended after {grace:?}: this Holochain leaves its network running after it shuts down (holochain#6010), so it does not exit by itself"
+                ),
                 Ok(StopOutcome::Killed) => log::warn!("[{line}] the {what} did not stop within {grace:?} and was killed"),
                 Ok(_) => log::info!("[{line}] the {what} stopped"),
                 Err(e) => log::warn!("[{line}] stopping the {what}: {e}"),
@@ -543,15 +549,13 @@ impl Supervisor {
         self.set_state(line, LineState::Off);
     }
 
-    /// Retire `line` for this session: [`Supervisor::stop_line`], in three
-    /// steps. Its ports go first, so no new call reaches it; the calls
-    /// already on it ([`crate::client::calling`]) get up to `drain` to
-    /// finish; then its conductor gets `grace` to stop. Nobody waits on a
-    /// retirement, and a conductor asked to stop with a network read still
-    /// in flight outlasted the 5 s a quit allows and was killed (seen in the
-    /// field on macOS). Blocking: up to `drain` + `grace` + the key store's
-    /// grace.
-    pub fn retire_line(&self, line: Line, drain: Duration, grace: Duration) {
+    /// Retire `line` for this session: [`Supervisor::stop_line`], once the
+    /// calls on it are done. Its ports go first, so no new call reaches it;
+    /// the calls already on it ([`crate::client::calling`]) get up to `drain`
+    /// to finish (seen in the field: a read in flight was cut by the stop);
+    /// then it stops as any line does. Blocking: up to `drain` plus the
+    /// line's stop graces.
+    pub fn retire_line(&self, line: Line, drain: Duration) {
         let taken = self.current.lock().unwrap().lines[slot(line)].take();
         if let Some(mut l) = taken {
             let started = Instant::now();
@@ -565,8 +569,7 @@ impl Supervisor {
                 0 => {}
                 n => log::warn!("[{line}] {n} call(s) still in flight after {} s: stopping the line anyway", drain.as_secs()),
             }
-            let lair_grace = l.process.timeouts.lair_stop;
-            l.process.stop_within(grace, lair_grace);
+            l.process.stop();
         }
         self.set_state(line, LineState::Off);
     }
@@ -879,12 +882,17 @@ mod session_tests {
     #[test]
     fn a_retirement_waits_for_the_calls_in_flight_then_stops_the_line() {
         let sup = Supervisor::new("t");
-        let (_, _) = sup.begin_session(running(Line::V07, 11), [1u8; 32]);
-        let session = sup.session().unwrap();
-        assert!(sup.attach(session, running(Line::V06, 12)).is_ok());
-
         // (The fake conductor ignores SIGINT, so each stop takes its whole
         // grace: a short one here.)
+        let quick = |line: Line, port: u16| {
+            let mut r = running(line, port);
+            r.process.timeouts.conductor_stop = Duration::from_millis(200);
+            r
+        };
+        let (_, _) = sup.begin_session(running(Line::V07, 11), [1u8; 32]);
+        let session = sup.session().unwrap();
+        assert!(sup.attach(session, quick(Line::V06, 12)).is_ok());
+
         // A call on the line finishes 300 ms in: the retirement waits for it.
         let call = crate::client::calling(Line::V06);
         let ending = std::thread::spawn(move || {
@@ -892,7 +900,7 @@ mod session_tests {
             drop(call);
         });
         let t = Instant::now();
-        sup.retire_line(Line::V06, Duration::from_secs(5), Duration::from_millis(200));
+        sup.retire_line(Line::V06, Duration::from_secs(5));
         ending.join().unwrap();
         assert!(t.elapsed() >= Duration::from_millis(500), "{:?}", t.elapsed());
         assert!(t.elapsed() < Duration::from_secs(3), "waited for the call, not the drain: {:?}", t.elapsed());
@@ -900,10 +908,10 @@ mod session_tests {
         assert_eq!(sup.ports(Line::V07), Some((11, 111)), "the session goes on");
 
         // A call that never ends holds it no longer than the drain.
-        assert!(sup.attach(session, running(Line::V06, 13)).is_ok());
+        assert!(sup.attach(session, quick(Line::V06, 13)).is_ok());
         let stuck = crate::client::calling(Line::V06);
         let t = Instant::now();
-        sup.retire_line(Line::V06, Duration::from_millis(400), Duration::from_millis(200));
+        sup.retire_line(Line::V06, Duration::from_millis(400));
         assert!((Duration::from_millis(600)..Duration::from_secs(3)).contains(&t.elapsed()), "{:?}", t.elapsed());
         assert_eq!(sup.ports(Line::V06), None);
         drop(stuck);
