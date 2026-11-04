@@ -1055,12 +1055,14 @@ mod session_tests {
         assert!(sup.attach(session, quick(Line::V06, 12)).is_ok());
 
         // A call on the line finishes 300 ms in: the retirement waits for it.
+        // (The clock starts before the call's thread, so the call ends at
+        // least 300 ms after it.)
+        let t = Instant::now();
         let call = crate::client::calling(Line::V06);
         let ending = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(300));
             drop(call);
         });
-        let t = Instant::now();
         sup.retire_line(Line::V06, Duration::from_secs(5));
         ending.join().unwrap();
         assert!(t.elapsed() >= Duration::from_millis(500), "{:?}", t.elapsed());
