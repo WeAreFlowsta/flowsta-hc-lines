@@ -99,8 +99,10 @@ impl AppClient {
     }
 
     /// Call a zome function. `payload` is the msgpack of the input; the
-    /// result is the msgpack of the output.
+    /// result is the msgpack of the output. Counted in flight on its line
+    /// while it runs ([`calling`]).
     pub async fn call(&self, role: &str, zome: &str, fn_name: &str, payload: Vec<u8>) -> Result<Vec<u8>, ZomeCallError> {
+        let _calling = calling(self.line());
         match self {
             #[cfg(feature = "line-06")]
             AppClient::V06(c) => {
@@ -122,6 +124,41 @@ impl AppClient {
             }
         }
     }
+}
+
+/// The calls in flight on each line: what a retirement waits for before it
+/// stops the line ([`crate::supervisor::Supervisor::retire_line`]).
+static IN_FLIGHT: [std::sync::atomic::AtomicUsize; 2] = [std::sync::atomic::AtomicUsize::new(0), std::sync::atomic::AtomicUsize::new(0)];
+
+fn in_flight_slot(line: Line) -> usize {
+    match line {
+        Line::V06 => 0,
+        Line::V07 => 1,
+    }
+}
+
+/// A call in flight on a line, counted until it is dropped.
+#[must_use = "the call counts as in flight only while this is held"]
+pub struct Calling(Line);
+
+impl Drop for Calling {
+    fn drop(&mut self) {
+        IN_FLIGHT[in_flight_slot(self.0)].fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Count a call on `line` as in flight while the guard is held.
+/// [`AppClient::call`] takes one itself; an app that calls a line's
+/// websocket directly holds one around each call, so a retirement waits
+/// for it too.
+pub fn calling(line: Line) -> Calling {
+    IN_FLIGHT[in_flight_slot(line)].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    Calling(line)
+}
+
+/// How many calls are in flight on `line` ([`calling`]).
+pub fn in_flight(line: Line) -> usize {
+    IN_FLIGHT[in_flight_slot(line)].load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// The 0.6 client's error as a kind.
