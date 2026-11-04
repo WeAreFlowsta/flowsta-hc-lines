@@ -29,6 +29,11 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
+/// How long a retirement waits for the calls already on the previous line,
+/// and then for its conductor to stop (`Supervisor::retire_line`).
+pub const RETIRE_DRAIN: std::time::Duration = std::time::Duration::from_secs(20);
+pub const RETIRE_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// An app hook's error: anything that displays (`String` converts with `?`).
 pub type HookError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -322,8 +327,8 @@ impl<C: PassApp> PassRunner<C> {
     pub async fn retire_previous(&self, app: &C, root: &Path, sup: &Arc<crate::supervisor::Supervisor>) -> bool {
         let Some(_claim) = self.claim(app, root) else { return false };
         let (sup, line) = (sup.clone(), self.spec.previous);
-        // Blocking: up to the line's stop graces.
-        if tokio::task::spawn_blocking(move || sup.stop_line(line)).await.is_err() {
+        // Blocking: up to the drain and the graces.
+        if tokio::task::spawn_blocking(move || sup.retire_line(line, RETIRE_DRAIN, RETIRE_GRACE)).await.is_err() {
             return false;
         }
         if let Err(e) = crate::marker::update_marker(root, &self.spec, |m| m.old_line_needed = Some(false)) {
