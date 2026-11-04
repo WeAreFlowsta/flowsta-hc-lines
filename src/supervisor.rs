@@ -325,7 +325,7 @@ impl Drop for AttachGuard<'_> {
 }
 
 /// One line start under way ([`Supervisor::wait_for_starts`]).
-struct StartGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+pub struct StartGuard<'a>(&'a std::sync::atomic::AtomicUsize);
 
 impl Drop for StartGuard<'_> {
     fn drop(&mut self) {
@@ -518,8 +518,11 @@ impl Supervisor {
         }
     }
 
-    /// Count one start under way until the guard drops.
-    fn count_start(&self) -> StartGuard<'_> {
+    /// Count a start under way until the guard drops. The app holds one
+    /// over its own steps before [`Supervisor::start_lines`] that write into
+    /// the lines' folders, so [`Supervisor::wait_for_starts`] waits for
+    /// those too; check [`LineHooks::wanted`]'s condition after taking it.
+    pub fn start_under_way(&self) -> StartGuard<'_> {
         self.starting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         StartGuard(&self.starting)
     }
@@ -767,11 +770,14 @@ impl Supervisor {
         secondary: Option<Line>,
         hooks: std::sync::Arc<dyn LineHooks>,
     ) -> std::result::Result<u64, String> {
-        let _starting = self.count_start();
+        let _starting = self.start_under_way();
         let running = match start_and_setup(hooks.as_ref(), primary, Role::Primary).await {
             Ok(r) => r,
             Err(e) if !hooks.wanted() => {
-                log::info!("[{primary}] the start is no longer wanted ({e})");
+                match e.as_str() {
+                    NOT_WANTED => log::info!("[{primary}] the start is no longer wanted"),
+                    _ => log::info!("[{primary}] the start is no longer wanted (it had failed: {e})"),
+                }
                 return Err(NOT_WANTED.into());
             }
             Err(e) => {
@@ -815,7 +821,7 @@ impl Supervisor {
             if sup.session() != Some(session) || sup.has(line) {
                 return;
             }
-            let _starting = sup.count_start();
+            let _starting = sup.start_under_way();
             sup.set_state(line, LineState::Starting);
             match start_and_setup(hooks.as_ref(), line, Role::Secondary).await {
                 Ok(running) => {
@@ -1061,6 +1067,24 @@ mod session_tests {
         sup.count_round(Line::V07, &crate::keeper::Round { reached: 2, ..Default::default() });
         sup.count_round(Line::V06, &crate::keeper::Round { reached: 1, ..Default::default() });
         assert_eq!((sup.reachable_rounds(Line::V06), sup.reachable_rounds(Line::V07)), (2, 1));
+    }
+
+    #[test]
+    fn the_apps_own_steps_before_a_start_are_waited_for() {
+        let sup = Supervisor::new("t");
+        assert!(sup.wait_for_starts(Duration::ZERO));
+        let first = sup.start_under_way();
+        let second = sup.start_under_way();
+        assert!(!sup.wait_for_starts(Duration::from_millis(60)));
+        drop(first);
+        assert!(!sup.wait_for_starts(Duration::from_millis(60)), "one is still under way");
+        std::thread::scope(|s| {
+            s.spawn(move || {
+                std::thread::sleep(Duration::from_millis(150));
+                drop(second);
+            });
+            assert!(sup.wait_for_starts(Duration::from_secs(5)));
+        });
     }
 
     #[test]
