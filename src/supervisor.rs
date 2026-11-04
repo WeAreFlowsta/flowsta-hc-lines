@@ -1302,10 +1302,9 @@ mod order_tests {
         assert_eq!(during.starts.load(Ordering::SeqCst), 1, "no secondary either");
     }
 
-    /// The race behind an erase that left a key store behind (11-04): the app
-    /// locks while its primary line is still starting, so its stop finds no
-    /// session. The start ends at its next step with nothing left running,
-    /// and `wait_for_starts` holds until it has.
+    /// The app locks while its primary line is still starting, before there
+    /// is a session to stop: the start ends at its next step with nothing
+    /// left running, and `wait_for_starts` holds until it has.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_stop_while_the_primary_starts_leaves_nothing_running() {
         let sup = Arc::new(Supervisor::new("t"));
