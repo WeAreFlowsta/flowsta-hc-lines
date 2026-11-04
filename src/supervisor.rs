@@ -305,6 +305,9 @@ pub struct Supervisor {
     current: std::sync::Mutex<Session>,
     states: std::sync::Mutex<[LineState; 2]>,
     attaching: [std::sync::atomic::AtomicBool; 2],
+    /// Line starts under way: from a start's first step until its line is in
+    /// a session or stopped again ([`Supervisor::wait_for_starts`]).
+    starting: std::sync::atomic::AtomicUsize,
     rendezvous: std::sync::Mutex<[Option<String>; 2]>,
     keeper_started: std::sync::atomic::AtomicBool,
     reachable: [std::sync::atomic::AtomicU64; 2],
@@ -321,6 +324,15 @@ impl Drop for AttachGuard<'_> {
     }
 }
 
+/// One line start under way ([`Supervisor::wait_for_starts`]).
+struct StartGuard<'a>(&'a std::sync::atomic::AtomicUsize);
+
+impl Drop for StartGuard<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
 impl Supervisor {
     /// `origin_prefix` names this app in its origins (`<prefix>-<32 hex>`).
     pub fn new(origin_prefix: impl Into<String>) -> Self {
@@ -331,6 +343,7 @@ impl Supervisor {
             current: std::sync::Mutex::new(Session::default()),
             states: std::sync::Mutex::new([LineState::Off; 2]),
             attaching: [std::sync::atomic::AtomicBool::new(false), std::sync::atomic::AtomicBool::new(false)],
+            starting: std::sync::atomic::AtomicUsize::new(0),
             rendezvous: std::sync::Mutex::new([None, None]),
             keeper_started: std::sync::atomic::AtomicBool::new(false),
             reachable: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
@@ -461,19 +474,54 @@ impl Supervisor {
     /// Begin a session on its primary line, which is up. A session still
     /// running is ended first; its lines are returned for the caller to stop.
     pub fn begin_session(&self, primary: RunningLine, agent_key: [u8; 32]) -> (u64, Vec<RunningLine>) {
+        self.begin_session_if(primary, agent_key, || true).unwrap_or_else(|_| unreachable!())
+    }
+
+    /// [`Supervisor::begin_session`] when `wanted` still holds, asked under
+    /// the session's lock: a stop the app makes after `wanted` turns false
+    /// either comes first (the line is handed back, to be stopped) or finds
+    /// the session to end.
+    fn begin_session_if(&self, primary: RunningLine, agent_key: [u8; 32], wanted: impl Fn() -> bool) -> std::result::Result<(u64, Vec<RunningLine>), RunningLine> {
         let line = primary.line();
-        let id = self.sessions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        let old = {
+        let (id, old) = {
             let mut s = self.current.lock().unwrap();
+            if !wanted() {
+                return Err(primary);
+            }
+            let id = self.sessions.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
             let old: Vec<RunningLine> = s.lines.iter_mut().filter_map(Option::take).collect();
             *s = Session { id, primary: Some(line), agent_key: Some(agent_key), lines: [None, None] };
             s.lines[slot(line)] = Some(primary);
-            old
+            (id, old)
         };
         let mut states = self.states.lock().unwrap();
         *states = [LineState::Off; 2];
         states[slot(line)] = LineState::Serving;
-        (id, old)
+        Ok((id, old))
+    }
+
+    /// Wait, blocking, until no line's start is under way, up to `within`;
+    /// whether none is. A start the app no longer wants
+    /// ([`LineHooks::wanted`]) ends at its next step, so after the app stops
+    /// wanting its starts this is how long until nothing writes to their
+    /// folders (before removing them, say).
+    pub fn wait_for_starts(&self, within: Duration) -> bool {
+        let until = Instant::now() + within;
+        loop {
+            if self.starting.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return true;
+            }
+            if Instant::now() >= until {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    /// Count one start under way until the guard drops.
+    fn count_start(&self) -> StartGuard<'_> {
+        self.starting.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        StartGuard(&self.starting)
     }
 
     /// Attach `running` to session `session`. Handed back when that session
@@ -651,29 +699,56 @@ pub trait LineHooks: Send + Sync + 'static {
     async fn secondary_failed(&self, _line: Line, _error: &str) {}
     /// A secondary line came up after its session had ended, and was stopped.
     async fn secondary_late(&self, _line: Line) {}
+    /// Whether the app still wants this start (by default, always): false
+    /// once it locked, erased or quit since asking for it. Asked before each
+    /// step of a line's start and again as the primary's session begins. A
+    /// start no longer wanted stops what it started and ends with
+    /// [`NOT_WANTED`]: a stop the app makes after this turns false never
+    /// misses a line that was still starting.
+    fn wanted(&self) -> bool {
+        true
+    }
+}
+
+/// The error of a start the app no longer wanted ([`LineHooks::wanted`]).
+pub const NOT_WANTED: &str = "the start is no longer wanted";
+
+async fn stop_process(mut process: LineProcess) {
+    let _ = tokio::task::spawn_blocking(move || {
+        process.stop();
+    })
+    .await;
 }
 
 /// Start and set up one line, restarted once when its setup asks
-/// ([`Setup::restart`]); a setup failure stops what was started.
+/// ([`Setup::restart`]); a setup failure, or a start no longer wanted,
+/// stops what was started.
 async fn start_and_setup(hooks: &dyn LineHooks, line: Line, role: Role) -> std::result::Result<RunningLine, String> {
     let mut restarted = false;
     loop {
+        if !hooks.wanted() {
+            return Err(NOT_WANTED.into());
+        }
         let mut process = hooks.start(line, role).await?;
+        if !hooks.wanted() {
+            log::info!("[{line}] no longer wanted as it came up - stopped");
+            stop_process(process).await;
+            return Err(NOT_WANTED.into());
+        }
         match hooks.setup(line, role, &mut process).await {
+            Ok(_) if !hooks.wanted() => {
+                log::info!("[{line}] no longer wanted as its setup ended - stopped");
+                stop_process(process).await;
+                return Err(NOT_WANTED.into());
+            }
             Ok(setup) if setup.restart && !restarted => {
                 log::info!("[{line}] apps installed this start: restarting the line once to give back the memory the install kept");
-                let _ = tokio::task::spawn_blocking(move || {
-                    process.stop();
-                })
-                .await;
+                stop_process(process).await;
                 restarted = true;
             }
             Ok(setup) => return Ok(RunningLine { process, app_port: setup.app_port }),
             Err(e) => {
-                let _ = tokio::task::spawn_blocking(move || {
-                    process.stop();
-                })
-                .await;
+                stop_process(process).await;
                 return Err(e);
             }
         }
@@ -692,8 +767,13 @@ impl Supervisor {
         secondary: Option<Line>,
         hooks: std::sync::Arc<dyn LineHooks>,
     ) -> std::result::Result<u64, String> {
+        let _starting = self.count_start();
         let running = match start_and_setup(hooks.as_ref(), primary, Role::Primary).await {
             Ok(r) => r,
+            Err(e) if !hooks.wanted() => {
+                log::info!("[{primary}] the start is no longer wanted ({e})");
+                return Err(NOT_WANTED.into());
+            }
             Err(e) => {
                 log::warn!("[{primary}] the primary line did not start ({e}) - one more try");
                 hooks.before_retry(primary, &e).await;
@@ -703,7 +783,14 @@ impl Supervisor {
         };
         let (admin_port, app_port) = (running.admin_port(), running.app_port);
         let key = running.process.agents.first().copied().unwrap_or([0u8; 32]);
-        let (session, leftover) = self.begin_session(running, key);
+        let (session, leftover) = match self.begin_session_if(running, key, || hooks.wanted()) {
+            Ok(begun) => begun,
+            Err(unwanted) => {
+                log::info!("[{primary}] no longer wanted as its session would begin - stopped");
+                stop_process(unwanted.process).await;
+                return Err(NOT_WANTED.into());
+            }
+        };
         for mut line in leftover {
             log::warn!("[{}] a line was still running at a new start - stopped", line.line());
             let _ = tokio::task::spawn_blocking(move || {
@@ -728,6 +815,7 @@ impl Supervisor {
             if sup.session() != Some(session) || sup.has(line) {
                 return;
             }
+            let _starting = sup.count_start();
             sup.set_state(line, LineState::Starting);
             match start_and_setup(hooks.as_ref(), line, Role::Secondary).await {
                 Ok(running) => {
@@ -747,7 +835,9 @@ impl Supervisor {
                     if sup.session() == Some(session) {
                         sup.set_state(line, LineState::Off);
                     }
-                    hooks.secondary_failed(line, &e).await;
+                    if e != NOT_WANTED {
+                        hooks.secondary_failed(line, &e).await;
+                    }
                 }
             }
         });
@@ -1003,6 +1093,13 @@ mod order_tests {
         /// Setups that ask for a restart (every time).
         restart_setup: Mutex<Vec<Line>>,
         secondary_delay_ms: u64,
+        primary_delay_ms: u64,
+        /// The app stopped wanting its starts (it locked, say).
+        unwanted: std::sync::atomic::AtomicBool,
+        /// Its setups stop wanting them, as a lock during an install would.
+        unwant_in_setup: bool,
+        /// The conductor pid of each line started.
+        pids: Mutex<Vec<u32>>,
         starts: AtomicU32,
         retries: AtomicU32,
         events: Mutex<Vec<String>>,
@@ -1019,6 +1116,9 @@ mod order_tests {
             if role == Role::Secondary && self.secondary_delay_ms > 0 {
                 tokio::time::sleep(Duration::from_millis(self.secondary_delay_ms)).await;
             }
+            if role == Role::Primary && self.primary_delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(self.primary_delay_ms)).await;
+            }
             {
                 let mut f = self.fail_starts.lock().unwrap();
                 if let Some(entry) = f.iter_mut().find(|(l, n)| *l == line && *n > 0) {
@@ -1026,18 +1126,24 @@ mod order_tests {
                     return Err(format!("{line} would not start"));
                 }
             }
+            let conductor = sleeper();
+            self.pids.lock().unwrap().push(conductor.id());
             Ok(LineProcess {
                 line,
                 lair: sleeper(),
-                conductor: sleeper(),
+                conductor,
                 admin_port: if line == Line::V06 { 1 } else { 2 },
                 lair_url: String::new(),
                 agents: vec![[9u8; 32]],
                 conductor_dir: PathBuf::new(),
-                timeouts: Timeouts::default(),
+                // (The sleepers ignore SIGINT: each stop takes its grace.)
+                timeouts: Timeouts { conductor_stop: Duration::from_millis(200), lair_stop: Duration::from_millis(200), ..Timeouts::default() },
             })
         }
         async fn setup(&self, line: Line, _role: Role, process: &mut LineProcess) -> std::result::Result<Setup, String> {
+            if self.unwant_in_setup {
+                self.unwanted.store(true, Ordering::SeqCst);
+            }
             if self.fail_setup.lock().unwrap().contains(&line) {
                 return Err("setup failed".into());
             }
@@ -1055,6 +1161,15 @@ mod order_tests {
         }
         async fn secondary_late(&self, line: Line) {
             self.events.lock().unwrap().push(format!("late {line}"));
+        }
+        fn wanted(&self) -> bool {
+            !self.unwanted.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Fake {
+        fn none_running(&self) -> bool {
+            self.pids.lock().unwrap().iter().all(|p| !crate::process::pid_alive(*p))
         }
     }
 
@@ -1141,6 +1256,50 @@ mod order_tests {
         sup.attach_line(session, Line::V07, hooks.clone());
         tokio::time::sleep(Duration::from_millis(300)).await;
         assert_eq!(hooks.starts.load(Ordering::SeqCst), 1, "only the primary was started");
+    }
+
+    /// A start the app no longer wants (it locked or erased since asking)
+    /// starts nothing, or stops what it started, and is never retried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_no_longer_wanted_stops_what_it_started() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let before = Arc::new(Fake::default());
+        before.unwanted.store(true, Ordering::SeqCst);
+        assert_eq!(sup.start_lines(Line::V07, Some(Line::V06), before.clone()).await.unwrap_err(), NOT_WANTED);
+        assert_eq!(before.starts.load(Ordering::SeqCst), 0, "nothing started");
+
+        let during = Arc::new(Fake { unwant_in_setup: true, ..Fake::default() });
+        assert_eq!(sup.start_lines(Line::V07, Some(Line::V06), during.clone()).await.unwrap_err(), NOT_WANTED);
+        assert_eq!((during.starts.load(Ordering::SeqCst), during.retries.load(Ordering::SeqCst)), (1, 0), "not retried");
+        assert!(during.none_running(), "the line it started was stopped");
+        assert_eq!((sup.session(), sup.state(Line::V07)), (None, LineState::Off));
+        assert!(sup.wait_for_starts(Duration::ZERO));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(during.starts.load(Ordering::SeqCst), 1, "no secondary either");
+    }
+
+    /// The race behind an erase that left a key store behind (11-04): the app
+    /// locks while its primary line is still starting, so its stop finds no
+    /// session. The start ends at its next step with nothing left running,
+    /// and `wait_for_starts` holds until it has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stop_while_the_primary_starts_leaves_nothing_running() {
+        let sup = Arc::new(Supervisor::new("t"));
+        let hooks = Arc::new(Fake { primary_delay_ms: 600, ..Fake::default() });
+        let starting = tokio::spawn({
+            let (sup, hooks) = (sup.clone(), hooks.clone());
+            async move { sup.start_lines(Line::V07, Some(Line::V06), hooks).await }
+        });
+        wait_for(|| hooks.starts.load(Ordering::SeqCst) == 1).await;
+        assert!(!sup.wait_for_starts(Duration::from_millis(50)), "the primary is still starting");
+        // The app's lock: it stops wanting the start, then stops the lines.
+        hooks.unwanted.store(true, Ordering::SeqCst);
+        assert!(!sup.stop(), "no session yet to stop");
+        let s = sup.clone();
+        assert!(tokio::task::spawn_blocking(move || s.wait_for_starts(Duration::from_secs(10))).await.unwrap());
+        assert_eq!(starting.await.unwrap().unwrap_err(), NOT_WANTED);
+        assert!(hooks.none_running());
+        assert_eq!((sup.session(), hooks.starts.load(Ordering::SeqCst)), (None, 1));
     }
 }
 
