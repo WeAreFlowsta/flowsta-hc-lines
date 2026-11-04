@@ -22,6 +22,8 @@ pub enum ConductorError {
     ExitedDuringStart { status: std::process::ExitStatus, log_tail: String },
     #[error("the conductor's admin interface was not ready after {secs}s on port {port}: {log_tail}")]
     AdminNotReady { port: u16, secs: u64, log_tail: String },
+    #[error("another process took admin port {port} as the conductor started: {log_tail}")]
+    PortTakenAtStart { port: u16, log_tail: String },
 }
 
 /// How many bytes of ops one gossip exchange may offer a 0.7 conductor
@@ -215,23 +217,83 @@ pub async fn start(
     }
 }
 
-/// Wait for the admin interface on `port`, watching the conductor: one that
-/// exits meanwhile fails at once with what it logged.
-pub async fn wait_admin(port: u16, timeout: Duration, child: &mut SidecarChild, conductor_dir: &Path) -> Result<()> {
+/// What answers on an admin port.
+#[derive(Debug, PartialEq, Eq)]
+enum AdminAnswer {
+    /// The conductor given the origin: it took a WebSocket handshake carrying it.
+    Ours,
+    /// Something that refused the handshake with an HTTP answer (a conductor
+    /// refuses an origin it was not given).
+    Another,
+    /// Nothing listening yet, a hang-up, or no answer in time.
+    Nothing,
+}
+
+/// Ask `port` for a WebSocket handshake carrying `origin`. A conductor takes
+/// only the origin in its config ([`fresh_origin`]), so a handshake taken is
+/// one with the conductor this start gave that origin.
+async fn admin_answer(port: u16, origin: &str) -> AdminAnswer {
+    use base64::Engine;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let within = Duration::from_secs(2);
+    let Ok(Ok(mut stream)) = tokio::time::timeout(within, tokio::net::TcpStream::connect(("127.0.0.1", port))).await else {
+        return AdminAnswer::Nothing;
+    };
+    let mut key = [0u8; 16];
+    getrandom::getrandom(&mut key).expect("the system random source");
+    let key = base64::engine::general_purpose::STANDARD.encode(key);
+    let request = format!(
+        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+         Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n"
+    );
+    if stream.write_all(request.as_bytes()).await.is_err() {
+        return AdminAnswer::Nothing;
+    }
+    // "HTTP/1.1 101"
+    let mut head = [0u8; 12];
+    match tokio::time::timeout(within, stream.read_exact(&mut head)).await {
+        Ok(Ok(_)) if head.starts_with(b"HTTP/") && &head[9..] == b"101" => AdminAnswer::Ours,
+        Ok(Ok(_)) if head.starts_with(b"HTTP/") => AdminAnswer::Another,
+        _ => AdminAnswer::Nothing,
+    }
+}
+
+/// Wait for this conductor's admin interface on `port`, watching the
+/// conductor: one that exits meanwhile fails at once with what it logged.
+/// The interface counts once it takes a handshake carrying `origin`. Two
+/// conductors starting together can pick the same free port, and the one
+/// that binds second never gets it: that start fails with
+/// [`ConductorError::PortTakenAtStart`], so it can try the next port.
+pub async fn wait_admin(port: u16, origin: &str, timeout: Duration, child: &mut SidecarChild, conductor_dir: &Path) -> Result<()> {
     let deadline = Instant::now() + timeout;
     let mut attempt = 0u32;
+    let mut another = false;
     while Instant::now() < deadline {
         attempt += 1;
         match child.try_wait() {
+            // Ours is gone, so whatever holds the port now is another's.
+            Ok(Some(_)) if another || std::net::TcpListener::bind(("127.0.0.1", port)).is_err() => {
+                return Err(ConductorError::PortTakenAtStart { port, log_tail: read_logs(conductor_dir) }.into());
+            }
             Ok(Some(status)) => return Err(ConductorError::ExitedDuringStart { status, log_tail: read_logs(conductor_dir) }.into()),
             Ok(None) => {}
             Err(source) => return Err(Error::Io { what: "check the conductor process", path: conductor_dir.to_path_buf(), source }),
         }
-        if tokio::net::TcpStream::connect(("127.0.0.1", port)).await.is_ok() {
-            log::info!("[conductor] admin interface ready on port {port} (attempt {attempt})");
-            return Ok(());
+        match admin_answer(port, origin).await {
+            AdminAnswer::Ours => {
+                log::info!("[conductor] admin interface ready on port {port} (attempt {attempt})");
+                return Ok(());
+            }
+            AdminAnswer::Another if !another => {
+                another = true;
+                log::warn!("[conductor] another process answers on admin port {port}; still waiting for this conductor's own");
+            }
+            _ => {}
         }
         tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    if another {
+        return Err(ConductorError::PortTakenAtStart { port, log_tail: read_logs(conductor_dir) }.into());
     }
     Err(ConductorError::AdminNotReady { port, secs: timeout.as_secs(), log_tail: read_logs(conductor_dir) }.into())
 }
@@ -310,5 +372,57 @@ mod tests {
         assert_eq!(pick_admin_port(&[taken, free]).unwrap(), free);
         let err = pick_admin_port(&[taken]).unwrap_err();
         assert!(matches!(err, Error::Conductor(ConductorError::PortsTaken { .. })), "{err}");
+    }
+
+    /// A stand-in on a port that answers every request with `reply`.
+    fn answering(reply: &'static str) -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        port
+    }
+
+    const SWITCHING: &str = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n";
+    const REFUSED: &str = "HTTP/1.1 400 Bad Request\r\n\r\n";
+
+    #[tokio::test]
+    async fn only_a_handshake_taken_counts_as_ours() {
+        let free = { std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port() };
+        assert_eq!(admin_answer(answering(SWITCHING), "o").await, AdminAnswer::Ours);
+        assert_eq!(admin_answer(answering(REFUSED), "o").await, AdminAnswer::Another);
+        assert_eq!(admin_answer(free, "o").await, AdminAnswer::Nothing);
+    }
+
+    /// A port another process answers on is not this conductor's, whether
+    /// this conductor exits (it could not bind) or stays up without it. One
+    /// that exits with its port free failed for a reason of its own.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_port_another_process_holds_is_reported_as_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let sh = |script: &str| SidecarCommand::new("/bin/sh").arg("-c").arg(script.to_string()).spawn().unwrap();
+        let taken = answering(REFUSED);
+        for (script, within) in [("sleep 1", 10), ("sleep 30", 2)] {
+            let mut child = sh(script);
+            let err = wait_admin(taken, "o", Duration::from_secs(within), &mut child, dir.path()).await.unwrap_err();
+            assert!(matches!(err, Error::Conductor(ConductorError::PortTakenAtStart { port, .. }) if port == taken), "{script}: {err}");
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        let free = { std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port() };
+        let mut child = sh("exit 3");
+        let err = wait_admin(free, "o", Duration::from_secs(10), &mut child, dir.path()).await.unwrap_err();
+        assert!(matches!(err, Error::Conductor(ConductorError::ExitedDuringStart { .. })), "{err}");
+        let mut child = sh("sleep 30");
+        wait_admin(answering(SWITCHING), "o", Duration::from_secs(5), &mut child, dir.path()).await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 }

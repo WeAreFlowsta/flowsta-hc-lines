@@ -202,35 +202,53 @@ pub async fn start_line(s: &LineStart<'_>, mut on_step: impl FnMut(StartStep) + 
     };
 
     on_step(StartStep::Conductor);
-    let conductor_up = async {
-        let admin_port = conductor::pick_admin_port(s.admin_ports)?;
-        let config = conductor::write_config(&conductor::ConfigInput {
-            line: s.line,
-            conductor_dir: s.conductor_dir,
-            lair_url: &url,
-            admin_port,
-            origin: s.origin,
-            rendezvous: s.rendezvous,
-            tuning: s.tuning,
-        })?;
-        let child = conductor::start(s.conductor_bin, &config, s.conductor_dir, s.passphrase, s.tuning).await?;
-        Ok::<_, Error>((admin_port, child))
-    }
-    .await;
-    let (admin_port, mut conductor) = match conductor_up {
-        Ok(v) => v,
-        Err(e) => {
+    // Ports another process took as this conductor started (another app's
+    // or account's conductor starting at the same moment): the next is tried.
+    let mut taken: Vec<u16> = Vec::new();
+    let (admin_port, conductor) = loop {
+        let candidates: Vec<u16> = s.admin_ports.iter().copied().filter(|p| !taken.contains(p)).collect();
+        if candidates.is_empty() {
             stop_child(&mut lair, StopRequest::Terminate, s.timeouts.lair_stop);
-            return Err(e);
+            return Err(conductor::ConductorError::PortsTaken { candidates: s.admin_ports.to_vec() }.into());
+        }
+        let conductor_up = async {
+            let admin_port = conductor::pick_admin_port(&candidates)?;
+            let config = conductor::write_config(&conductor::ConfigInput {
+                line: s.line,
+                conductor_dir: s.conductor_dir,
+                lair_url: &url,
+                admin_port,
+                origin: s.origin,
+                rendezvous: s.rendezvous,
+                tuning: s.tuning,
+            })?;
+            let child = conductor::start(s.conductor_bin, &config, s.conductor_dir, s.passphrase, s.tuning).await?;
+            Ok::<_, Error>((admin_port, child))
+        }
+        .await;
+        let (admin_port, mut conductor) = match conductor_up {
+            Ok(v) => v,
+            Err(e) => {
+                stop_child(&mut lair, StopRequest::Terminate, s.timeouts.lair_stop);
+                return Err(e);
+            }
+        };
+
+        on_step(StartStep::WaitAdmin);
+        match conductor::wait_admin(admin_port, s.origin, s.timeouts.admin, &mut conductor, s.conductor_dir).await {
+            Ok(()) => break (admin_port, conductor),
+            Err(Error::Conductor(conductor::ConductorError::PortTakenAtStart { port, .. })) => {
+                stop_child(&mut conductor, StopRequest::Interrupt, s.timeouts.conductor_stop);
+                log::warn!("[{}] another process took admin port {port} as this conductor started; trying the next", s.line);
+                taken.push(port);
+            }
+            Err(e) => {
+                stop_child(&mut conductor, StopRequest::Interrupt, s.timeouts.conductor_stop);
+                stop_child(&mut lair, StopRequest::Terminate, s.timeouts.lair_stop);
+                return Err(e);
+            }
         }
     };
-
-    on_step(StartStep::WaitAdmin);
-    if let Err(e) = conductor::wait_admin(admin_port, s.timeouts.admin, &mut conductor, s.conductor_dir).await {
-        stop_child(&mut conductor, StopRequest::Interrupt, s.timeouts.conductor_stop);
-        stop_child(&mut lair, StopRequest::Terminate, s.timeouts.lair_stop);
-        return Err(e);
-    }
     log::info!("[{}] key store and conductor up (admin port {admin_port})", s.line);
     Ok(LineProcess {
         line: s.line,
@@ -950,6 +968,53 @@ mod tests {
         assert!(matches!(err, Error::Conductor(conductor::ConductorError::PortsTaken { .. })), "{err}");
         let pid: u32 = std::fs::read_to_string(lair_dir.join("pid_file")).unwrap().trim().parse().unwrap();
         assert!(!crate::process::pid_alive(pid), "the key store it started was stopped");
+
+        // Another process takes the picked port before the conductor binds it
+        // (another conductor starting at the same moment, which refuses this
+        // start's origin): the start goes on to the next port.
+        let free = || std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port();
+        let (first, second) = (free(), free());
+        assert_ne!(first, second);
+        let mut squatted = false;
+        let mut steps = Vec::new();
+        let mut p = start_line(
+            &LineStart {
+                line: Line::V07,
+                lair_bin: &lair_bin,
+                conductor_bin: &cond_bin,
+                lair_dir: &lair_dir,
+                conductor_dir: &root.join("conductor-07"),
+                passphrase: "live",
+                sockets: &sockets,
+                admin_ports: &[first, second],
+                origin: &origin,
+                rendezvous: &rendezvous,
+                tuning: &tuning,
+                agents: &agents,
+                timeouts: Timeouts::default(),
+            },
+            |step| {
+                steps.push(step);
+                if step == StartStep::WaitAdmin && !squatted {
+                    squatted = true;
+                    let other = std::net::TcpListener::bind(("127.0.0.1", first)).expect("the port is still free right after the spawn");
+                    std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        for mut stream in other.incoming().flatten() {
+                            let mut request = [0u8; 1024];
+                            let _ = stream.read(&mut request);
+                            let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n");
+                        }
+                    });
+                }
+            },
+        )
+        .await
+        .unwrap_or_else(|e| panic!("the start after a taken port: {e}"));
+        assert_eq!(p.admin_port, second);
+        assert_eq!(steps.iter().filter(|s| **s == StartStep::WaitAdmin).count(), 2, "{steps:?}");
+        let report = p.stop();
+        assert!(matches!(report.conductor, Ok(StopOutcome::Exited)), "{:?}", report.conductor);
     }
 }
 
