@@ -45,6 +45,10 @@ pub struct NetworkTuning {
     pub gossip_max_op_bytes: Option<u32>,
     /// The 0.7 `db_sync_level` (`Normal`, `Full`, `Off`). Ignored on 0.6.
     pub db_sync_level: Option<String>,
+    /// The 0.6 `db_sync_strategy` (`Fast`, `Resilient`): how SQLite syncs
+    /// each write to disk. Ignored on 0.7, where `db_sync_level` is the
+    /// matching setting.
+    pub db_sync_strategy: Option<String>,
     /// `RUST_LOG` for the conductor when this process has none: the
     /// conductor logs nothing without it. A developer's own `RUST_LOG` is
     /// inherited instead.
@@ -58,6 +62,7 @@ impl NetworkTuning {
             request_timeout_s: None,
             gossip_max_op_bytes: (line == Line::V07).then_some(GOSSIP_OP_BYTES_07),
             db_sync_level: None,
+            db_sync_strategy: None,
             rust_log: Some("warn".into()),
         }
     }
@@ -104,6 +109,11 @@ pub fn config_yaml(input: &ConfigInput) -> String {
     }
     if let Some(t) = input.tuning.request_timeout_s {
         y.push_str(&format!("  request_timeout_s: {t}\n"));
+    }
+    if input.line == Line::V06 {
+        if let Some(strategy) = &input.tuning.db_sync_strategy {
+            y.push_str(&format!("db_sync_strategy: {strategy}\n"));
+        }
     }
     if input.line == Line::V07 {
         if let Some(b) = input.tuning.gossip_max_op_bytes {
@@ -345,6 +355,21 @@ mod tests {
         assert!(c.contains("maxGossipOpBytes: 1048576"));
         assert!(!c.contains("base64_auth_material") && !c.contains("signal_url") && !c.contains("request_timeout_s"));
         assert_eq!(NetworkTuning::for_line(Line::V06).gossip_max_op_bytes, None);
+    }
+
+    #[test]
+    fn each_line_takes_only_its_own_sync_setting() {
+        let r = Rendezvous::new("https://open.example.com");
+        let mut t = NetworkTuning::for_line(Line::V06);
+        t.db_sync_strategy = Some("Resilient".into());
+        t.db_sync_level = Some("Normal".into());
+        let input = |line| ConfigInput { line, conductor_dir: Path::new("/c"), lair_url: "u", admin_port: 1, origin: "o", rendezvous: &r, tuning: &t };
+        let c06 = config_yaml(&input(Line::V06));
+        assert!(c06.ends_with("db_sync_strategy: Resilient\n"));
+        assert!(!c06.contains("db_sync_level"), "0.6 has no db_sync_level");
+        let c07 = config_yaml(&input(Line::V07));
+        assert!(c07.ends_with("db_sync_level: Normal\n"));
+        assert!(!c07.contains("db_sync_strategy"), "0.7 renamed it to db_sync_level");
     }
 
     #[test]
