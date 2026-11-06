@@ -355,6 +355,22 @@ pub struct Supervisor {
     rendezvous: std::sync::Mutex<[Option<String>; 2]>,
     keeper_started: std::sync::atomic::AtomicBool,
     reachable: [std::sync::atomic::AtomicU64; 2],
+    last_rounds: std::sync::Mutex<[Option<KeeperStatus>; 2]>,
+}
+
+/// A line's last keeper round ([`Supervisor::last_round`]).
+#[derive(Clone, Debug)]
+#[non_exhaustive]
+pub struct KeeperStatus {
+    pub at: std::time::SystemTime,
+    /// The servers the keeper asks.
+    pub servers: usize,
+    pub round: crate::keeper::Round,
+    /// How long the keeper has been registering for the conductor, whose own
+    /// registration did not reach its server; None while it registers itself.
+    pub stalled_for: Option<Duration>,
+    /// The rendezvous the conductor was configured with.
+    pub conductor: Option<String>,
 }
 
 /// Held while one line is being attached; dropping it lets the next try in.
@@ -391,6 +407,7 @@ impl Supervisor {
             rendezvous: std::sync::Mutex::new([None, None]),
             keeper_started: std::sync::atomic::AtomicBool::new(false),
             reachable: [std::sync::atomic::AtomicU64::new(0), std::sync::atomic::AtomicU64::new(0)],
+            last_rounds: std::sync::Mutex::new([None, None]),
         }
     }
 
@@ -405,6 +422,16 @@ impl Supervisor {
         if round.reached > 0 {
             self.reachable[slot(line)].fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
+    }
+
+    /// `line`'s last keeper round, for an app's diagnostics; None before the
+    /// first (about 70 s after the keeper starts).
+    pub fn last_round(&self, line: Line) -> Option<KeeperStatus> {
+        self.last_rounds.lock().unwrap()[slot(line)].clone()
+    }
+
+    fn record_round(&self, line: Line, status: KeeperStatus) {
+        self.last_rounds.lock().unwrap()[slot(line)] = Some(status);
     }
 
     /// Record the rendezvous `line`'s conductor was configured with at its
@@ -473,8 +500,15 @@ impl Supervisor {
                         }
                     };
                     let conductor = sup.rendezvous(line);
-                    match keepers[slot(line)].run_once(&admin, conductor.as_deref()).await {
-                        Ok(round) => sup.count_round(line, &round),
+                    let keeper = &mut keepers[slot(line)];
+                    match keeper.run_once(&admin, conductor.as_deref()).await {
+                        Ok(round) => {
+                            sup.count_round(line, &round);
+                            sup.record_round(
+                                line,
+                                KeeperStatus { at: std::time::SystemTime::now(), servers: keeper.server_count(), round, stalled_for: keeper.stalled_for(), conductor },
+                            );
+                        }
                         Err(e) => log::debug!("{label} round skipped: {e}"),
                     }
                 }
@@ -1182,6 +1216,24 @@ mod session_tests {
         sup.count_round(Line::V07, &crate::keeper::Round { reached: 2, ..Default::default() });
         sup.count_round(Line::V06, &crate::keeper::Round { reached: 1, ..Default::default() });
         assert_eq!((sup.reachable_rounds(Line::V06), sup.reachable_rounds(Line::V07)), (2, 1));
+    }
+
+    #[test]
+    fn each_lines_last_round_is_kept_for_the_app() {
+        let sup = Supervisor::new("t");
+        assert!(sup.last_round(Line::V06).is_none(), "nothing before the first round");
+        let status = |reached| KeeperStatus {
+            at: std::time::SystemTime::now(),
+            servers: 2,
+            round: crate::keeper::Round { reached, ..Default::default() },
+            stalled_for: None,
+            conductor: Some("https://b.example.com".into()),
+        };
+        sup.record_round(Line::V06, status(1));
+        sup.record_round(Line::V06, status(2));
+        sup.record_round(Line::V07, status(0));
+        assert_eq!(sup.last_round(Line::V06).unwrap().round.reached, 2, "the latest round");
+        assert_eq!(sup.last_round(Line::V07).unwrap().round.reached, 0);
     }
 
     #[test]
