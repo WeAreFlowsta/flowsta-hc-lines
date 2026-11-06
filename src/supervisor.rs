@@ -170,6 +170,32 @@ macro_rules! ensure_agents {
     }};
 }
 
+/// Connect to a running key store and ensure one agent, on the line's own
+/// client crate.
+macro_rules! ensure_one_agent {
+    ($v:ident, $url:expr, $passphrase:expr, $source:expr) => {{
+        let client = keystore::$v::connect($url, $passphrase, Duration::from_secs(30)).await?;
+        match $source {
+            KeySource::Seed { seed, tag } => keystore::$v::import_seed(&client, seed, tag).await,
+            KeySource::NewSeed { tag } => keystore::$v::new_seed(&client, tag).await,
+            KeySource::Existing { tag } => keystore::$v::existing(&client, tag).await,
+        }
+    }};
+}
+
+/// One agent on the key store at `url` (a running line's), by the same rules
+/// as a start's ([`KeySource`]).
+async fn agent_on(line: Line, url: &str, passphrase: &str, source: &KeySource) -> Result<[u8; 32]> {
+    match line {
+        #[cfg(feature = "line-06")]
+        Line::V06 => ensure_one_agent!(v06, url, passphrase, source),
+        #[cfg(feature = "line-07")]
+        Line::V07 => ensure_one_agent!(v07, url, passphrase, source),
+        #[allow(unreachable_patterns)]
+        other => Err(Error::LineNotCompiled(other)),
+    }
+}
+
 async fn agents_on(url: &str, s: &LineStart<'_>, lair: &mut SidecarChild, on_step: &mut (dyn FnMut(StartStep) + Send)) -> Result<Vec<[u8; 32]>> {
     match s.line {
         #[cfg(feature = "line-06")]
@@ -485,6 +511,20 @@ impl Supervisor {
     }
 
     /// The key the lines run as (the same on both).
+    /// Ensure one more agent on a running line, for an app that makes agents
+    /// while it runs (a new AI, a new member). The key comes from the line's
+    /// own key store at its running address, by the same rules as a start
+    /// ([`KeySource`]); `passphrase` is the one the line started with (the
+    /// supervisor does not keep it). Installing the agent's app is the app's
+    /// next step, through the admin client. Each line's store is separate:
+    /// an agent needed on both lines is added on each (a [`KeySource::Seed`]
+    /// gives the same key on both).
+    pub async fn add_agent(&self, line: Line, passphrase: &str, source: &KeySource) -> Result<[u8; 32]> {
+        let url = self.current.lock().unwrap().lines[slot(line)].as_ref().map(|r| r.process.lair_url.clone());
+        let url = url.ok_or(Error::LineNotRunning(line))?;
+        agent_on(line, &url, passphrase, source).await
+    }
+
     pub fn agent_key(&self) -> Option<[u8; 32]> {
         self.current.lock().unwrap().agent_key
     }
@@ -928,6 +968,12 @@ mod tests {
             assert!(tokio::net::TcpStream::connect(("127.0.0.1", p.admin_port)).await.is_ok());
             let config = std::fs::read_to_string(cond_dir.join("conductor-config.yaml")).unwrap();
             assert_eq!(config.contains("maxGossipOpBytes: 1048576"), line == Line::V07);
+            // An agent made while the line runs (a new AI): a new seed, the
+            // same key for the same tag again, found as an existing tag.
+            let made = agent_on(line, &p.lair_url, "live", &KeySource::NewSeed { tag: "ai-2".into() }).await.unwrap();
+            assert_ne!(made, p.agents[0]);
+            assert_eq!(agent_on(line, &p.lair_url, "live", &KeySource::NewSeed { tag: "ai-2".into() }).await.unwrap(), made);
+            assert_eq!(agent_on(line, &p.lair_url, "live", &KeySource::Existing { tag: "ai-2".into() }).await.unwrap(), made);
             started.push(p);
         }
         assert_eq!(started[0].agents, started[1].agents, "one seed, one key on both lines");
@@ -1408,5 +1454,18 @@ mod rendezvous_tests {
         assert_eq!(s.rendezvous(Line::V07), None, "each line its own");
         s.set_rendezvous(Line::V06, None);
         assert_eq!(s.rendezvous(Line::V06), None);
+    }
+}
+
+#[cfg(test)]
+mod add_agent_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn an_agent_is_added_only_to_a_running_line() {
+        let s = Supervisor::new("t");
+        let err = s.add_agent(Line::V07, "p", &KeySource::NewSeed { tag: "ai-1".into() }).await.unwrap_err();
+        assert!(matches!(err, Error::LineNotRunning(Line::V07)), "{err}");
+        assert_eq!(err.to_string(), "Holochain line 0.7 is not running");
     }
 }
