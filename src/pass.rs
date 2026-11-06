@@ -10,8 +10,13 @@
 //! fresh read), then the carried kinds (records the app carries itself,
 //! such as public records another key signed), then the flip.
 //!
-//! - A failure in an own kind, or in a carried kind that blocks the flip,
-//!   stops the pass.
+//! - In an own kind, every unit is tried: a unit that fails is noted with its
+//!   error (`KindOutcome::failed_units`) and the others still copy. The kind
+//!   is then incomplete, so the flip waits, and the pass stops before the
+//!   carried kinds. An app may leave out of `units` a unit that keeps
+//!   failing; its records then stay readable on the previous line only, and
+//!   the app must keep that line (the retirement policy) until it copies.
+//! - A failure in a carried kind that blocks the flip stops the pass.
 //! - A carried kind that does not block the flip is carried again each pass
 //!   until complete; its failure is noted and the pass goes on.
 //! - Passes keep running after the flip while the previous line runs, so
@@ -127,6 +132,13 @@ pub trait VersionedKind<C>: Send + Sync {
     /// Called before the read that checks the writes: a cache of earlier
     /// reads must not answer it.
     fn forget_cache(&self, _cx: &PassCx<'_, C>) {}
+    /// `v` with its body, read from `line`. An app whose records are large
+    /// lists ids and times only in `versions` (an empty `body`) and reads
+    /// each body here: the runner asks only for the versions it writes.
+    /// Default: `v` as listed.
+    async fn full(&self, _cx: &PassCx<'_, C>, _line: Line, _unit: &CopyUnit, v: &Version) -> Result<Version, HookError> {
+        Ok(v.clone())
+    }
 }
 
 /// The app's own kinds. Hash-keyed kinds (immutable records with parents)
@@ -219,6 +231,9 @@ pub struct KindOutcome {
     pub complete: bool,
     /// A failure of a kind that does not block the flip (the pass went on).
     pub error: Option<String>,
+    /// Own kinds: the units that failed this pass, with their errors (the
+    /// other units were copied).
+    pub failed_units: Vec<(String, String)>,
 }
 
 impl KindOutcome {
@@ -416,9 +431,16 @@ impl<C: PassApp> PassRunner<C> {
             for unit in &units {
                 if let Err(e) = copy_versions(k.as_ref(), cx, unit, &mut out.kinds[at]).await {
                     out.kinds[at].complete = false;
-                    out.error = Some(format!("{}: {e}", k.name()));
-                    return;
+                    out.kinds[at].failed_units.push((unit.id.clone(), e.to_string()));
                 }
+            }
+            let failed = &out.kinds[at].failed_units;
+            if let Some((unit, e)) = failed.first() {
+                out.error = Some(match failed.len() {
+                    1 => format!("{}: {e}", k.name()),
+                    n => format!("{}: {n} units failed, the first {unit}: {e}", k.name()),
+                });
+                return;
             }
             flip_ready &= out.kinds[at].complete;
         }
@@ -508,7 +530,8 @@ async fn copy_versions<C>(k: &dyn VersionedKind<C>, cx: &PassCx<'_, C>, unit: &C
     let missing = missing_on(&winners, &on_current);
     kind.present += winners.len() - missing.len();
     for (v, supersedes) in missing {
-        k.write(cx, cx.spec.current, unit, v, supersedes.as_deref()).await?;
+        let full = k.full(cx, cx.spec.previous, unit, v).await?;
+        k.write(cx, cx.spec.current, unit, &full, supersedes.as_deref()).await?;
         kind.written += 1;
     }
     k.forget_cache(cx);
@@ -899,5 +922,91 @@ mod tests {
         assert_eq!(r.status(b).last, None);
         drop(r.claim(&app, b).unwrap());
         assert!(r.claim(&app, b).is_some(), "a dropped claim frees the runner");
+    }
+
+    /// Own data kept per unit and line, listed without bodies; `full` reads
+    /// the body. One unit can be set to fail.
+    #[derive(Default)]
+    struct PerUnit {
+        rows: Mutex<HashMap<(Line, String), Vec<Version>>>,
+        bodies: Mutex<HashMap<String, Vec<u8>>>,
+        broken: Mutex<Option<String>>,
+        bodies_read: AtomicUsize,
+    }
+    struct Ais(Arc<PerUnit>);
+    #[async_trait::async_trait]
+    impl VersionedKind<App> for Ais {
+        fn name(&self) -> &'static str {
+            "messages"
+        }
+        async fn versions(&self, _cx: &PassCx<'_, App>, line: Line, u: &CopyUnit) -> Result<Vec<Version>, HookError> {
+            if self.0.broken.lock().unwrap().as_deref() == Some(u.id.as_str()) {
+                return Err(format!("{} does not start", u.id).into());
+            }
+            Ok(self.0.rows.lock().unwrap().get(&(line, u.id.clone())).cloned().unwrap_or_default())
+        }
+        async fn write(&self, _cx: &PassCx<'_, App>, line: Line, u: &CopyUnit, v: &Version, _s: Option<&[u8]>) -> Result<Vec<u8>, HookError> {
+            assert!(!v.body.is_empty(), "the runner writes the full version");
+            let mut copy = v.clone();
+            copy.body = Vec::new();
+            self.0.rows.lock().unwrap().entry((line, u.id.clone())).or_default().push(copy);
+            self.0.bodies.lock().unwrap().insert(format!("{:?}/{}/{}", line, u.id, v.logical_id), v.body.clone());
+            Ok(vec![200; 39])
+        }
+        async fn full(&self, _cx: &PassCx<'_, App>, _line: Line, _u: &CopyUnit, v: &Version) -> Result<Version, HookError> {
+            self.0.bodies_read.fetch_add(1, Ordering::SeqCst);
+            Ok(Version { body: vec![7; 2048], ..v.clone() })
+        }
+    }
+    struct Units(Vec<&'static str>);
+    #[async_trait::async_trait]
+    impl CopyUnits<App> for Units {
+        async fn units(&self, _cx: &PassCx<'_, App>) -> Result<Vec<CopyUnit>, HookError> {
+            Ok(self.0.iter().map(|id| CopyUnit { id: id.to_string() }).collect())
+        }
+    }
+    fn listed(id: &str, time: u64) -> Version {
+        Version { body: Vec::new(), ..v(id, time, 1) }
+    }
+    fn per_unit_runner(data: &Arc<PerUnit>, units: Vec<&'static str>) -> PassRunner<App> {
+        PassRunner::new(SPEC, Arc::new(Units(units)), vec![OwnKind::Versioned(Arc::new(Ais(data.clone())))], vec![], Arc::new(Flip))
+    }
+
+    #[tokio::test]
+    async fn one_failing_unit_does_not_stop_the_others_and_the_flip_waits() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = Arc::new(PerUnit::default());
+        for ai in ["ai-1", "ai-2", "ai-3"] {
+            data.rows.lock().unwrap().insert((Line::V06, ai.to_string()), vec![listed(&format!("{ai}/m1"), 1000)]);
+        }
+        *data.broken.lock().unwrap() = Some("ai-2".into());
+        let r = per_unit_runner(&data, vec!["ai-1", "ai-2", "ai-3"]);
+        let o = r.run(&app(vec![], vec![]), dir.path(), "t").await;
+        let k = o.kind("messages").unwrap();
+        assert_eq!(k.written, 2, "ai-1 and ai-3 copied");
+        assert_eq!(k.failed_units, vec![("ai-2".to_string(), "ai-2 does not start".to_string())]);
+        assert!(!k.complete && !o.flipped, "the flip waits for every unit");
+        assert_eq!(o.error.as_deref(), Some("messages: ai-2 does not start"));
+        assert_eq!(Marker::load(dir.path(), &SPEC), MarkerRead::Absent);
+
+        // The unit starts again: it copies, nothing is written twice, the flip happens.
+        *data.broken.lock().unwrap() = None;
+        let o = r.run(&app(vec![], vec![]), dir.path(), "t").await;
+        let k = o.kind("messages").unwrap();
+        assert_eq!((k.written, k.present, k.complete), (1, 2, true));
+        assert!(k.failed_units.is_empty() && o.flipped);
+    }
+
+    #[tokio::test]
+    async fn bodies_are_read_only_for_the_versions_written() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = Arc::new(PerUnit::default());
+        data.rows.lock().unwrap().insert((Line::V06, "ai-1".into()), vec![listed("a", 1000), listed("b", 1000), listed("c", 1000)]);
+        data.rows.lock().unwrap().insert((Line::V07, "ai-1".into()), vec![listed("a", 1000)]);
+        let o = per_unit_runner(&data, vec!["ai-1"]).run(&app(vec![], vec![]), dir.path(), "t").await;
+        let k = o.kind("messages").unwrap();
+        assert_eq!((k.total, k.present, k.written, k.complete), (3, 1, 2, true));
+        assert_eq!(data.bodies_read.load(Ordering::SeqCst), 2, "only b and c were read in full");
+        assert_eq!(data.bodies.lock().unwrap().get("V07/ai-1/b").map(Vec::len), Some(2048), "the copy carries the full body");
     }
 }
