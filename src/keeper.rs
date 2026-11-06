@@ -232,7 +232,7 @@ pub(crate) fn parse_token(body: &str) -> Option<String> {
 }
 
 /// What one round did.
-#[derive(Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Round {
     /// Our notes we registered ourselves in a network whose listing we could trust.
     pub put: usize,
@@ -278,6 +278,18 @@ impl Keeper {
             .build()
             .unwrap_or_default();
         Self { servers, client, registered: HashSet::new(), stalled_since: None, every_server_dark: false, told_elsewhere: HashSet::new() }
+    }
+
+    /// How many servers this keeper asks.
+    pub fn server_count(&self) -> usize {
+        self.servers.len()
+    }
+
+    /// How long the keeper has been registering for the conductor, whose own
+    /// registration did not reach its server; None while the conductor
+    /// registers by itself.
+    pub fn stalled_for(&self) -> Option<std::time::Duration> {
+        self.stalled_since.map(|since| since.elapsed())
     }
 
     /// Read the conductor's own notes and peers, compare with every server,
