@@ -1,6 +1,13 @@
 //! Where a conductor meets its peers: one server does peer discovery
 //! (bootstrap), signaling on the 0.6 line, and the Iroh relay.
 
+use std::time::Duration;
+
+/// How long a start waits for the rendezvous to answer before starting
+/// without its auth: long enough for a slow link, short enough not to hold
+/// up an offline start.
+pub const PROBE_TIMEOUT: Duration = Duration::from_millis(2500);
+
 /// One rendezvous server, as a conductor config names it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Rendezvous {
@@ -34,6 +41,43 @@ impl Rendezvous {
                 format!("wss://{host}")
             }
         }
+    }
+}
+
+/// Whether a bootstrap server answers now: `GET <bootstrap_url>/health`
+/// returns a success status within `timeout`. kitsune2's bootstrap server
+/// serves it without auth.
+pub async fn answers(bootstrap_url: &str, timeout: Duration) -> bool {
+    let health = format!("{}/health", bootstrap_url.trim_end_matches('/'));
+    let Ok(client) = reqwest::Client::builder().timeout(timeout).build() else {
+        return false;
+    };
+    matches!(client.get(&health).send().await, Ok(r) if r.status().is_success())
+}
+
+/// A rendezvous as a conductor start uses it ([`Rendezvous::for_start`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForStart {
+    pub rendezvous: Rendezvous,
+    /// The start goes without the auth because its server did not answer.
+    /// The app restarts the line with the auth once [`answers`] is true.
+    pub without_auth: bool,
+}
+
+impl Rendezvous {
+    /// The entry as a start should use it. Holochain 0.6.1 and 0.7.1
+    /// authenticate with the relay while they start, and a conductor that
+    /// cannot (no network) refuses to start at all. So a start with auth
+    /// material probes first: answering, the entry is used as it is; not
+    /// answering, it is used without its auth, the conductor runs, and
+    /// everything local works until the network is back. An entry with no
+    /// auth material is used as it is, without a probe.
+    pub async fn for_start(&self, timeout: Duration) -> ForStart {
+        let has_auth = self.auth_material.as_deref().is_some_and(|m| !m.is_empty());
+        if !has_auth || answers(&self.bootstrap_url, timeout).await {
+            return ForStart { rendezvous: self.clone(), without_auth: false };
+        }
+        ForStart { rendezvous: Rendezvous { auth_material: None, ..self.clone() }, without_auth: true }
     }
 }
 
@@ -74,6 +118,51 @@ mod tests {
         assert_eq!(relay_url_for("https://[::1]:443"), "https://[::1]:443/");
         assert_eq!(relay_url_for("http://node1.example.com:18080"), "http://node1.example.com.:18080/");
         assert_eq!(relay_url_for("http://192.168.1.3:18080"), "http://192.168.1.3:18080/");
+    }
+
+    /// A local server that answers every request with 200 and an empty body.
+    async fn health_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").await;
+            }
+        });
+        format!("http://{addr}")
+    }
+
+    /// A URL nothing listens on.
+    fn silent_url() -> String {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        format!("http://127.0.0.1:{port}")
+    }
+
+    #[tokio::test]
+    async fn a_start_drops_the_auth_only_when_its_server_does_not_answer() {
+        let live = health_server().await;
+        let dead = silent_url();
+        assert!(answers(&live, PROBE_TIMEOUT).await);
+        assert!(!answers(&dead, PROBE_TIMEOUT).await);
+
+        let with_auth = |url: &str| Rendezvous { auth_material: Some("eyJmb28iOiJiYXIifQ==".into()), ..Rendezvous::new(url) };
+        let answering = with_auth(&live).for_start(PROBE_TIMEOUT).await;
+        assert_eq!(answering.rendezvous, with_auth(&live));
+        assert!(!answering.without_auth);
+
+        let offline = with_auth(&dead).for_start(PROBE_TIMEOUT).await;
+        assert_eq!(offline.rendezvous.auth_material, None, "offline: no auth, so the conductor starts");
+        assert_eq!(offline.rendezvous.bootstrap_url, dead);
+        assert!(offline.without_auth, "the app knows to restart the line with the auth later");
+
+        let no_auth = Rendezvous::new(&dead).for_start(PROBE_TIMEOUT).await;
+        assert_eq!(no_auth.rendezvous, Rendezvous::new(&dead), "nothing to drop: used as it is");
+        assert!(!no_auth.without_auth);
     }
 
     #[test]
