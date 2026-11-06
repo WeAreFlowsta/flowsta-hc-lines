@@ -151,6 +151,54 @@ pub async fn wait_cell_ready_07(
     }
 }
 
+/// Wait until `probe` succeeds, retrying while it says the cell is not
+/// running: up to `w.attempts`, `w.gap` apart, running `reenable` for each
+/// of `w.reenable` between tries (a conductor can list an app as enabled
+/// while its cells still start, and disable them again on a restart). Any
+/// other error ends the wait. Returns the attempt it took.
+///
+/// The probe is the app's own call and should only read: unlike
+/// [`AdminClient::wait_cell_ready`], whose signing grant is a chain write,
+/// this costs nothing per cell, which matters for an app with many cells.
+pub async fn wait_ready_by<P, PF, R, RF>(w: &ReadyWait<'_>, mut probe: P, mut reenable: R) -> Result<u32, crate::client::ZomeCallError>
+where
+    P: FnMut() -> PF,
+    PF: std::future::Future<Output = Result<(), crate::client::ZomeCallError>>,
+    R: FnMut(String) -> RF,
+    RF: std::future::Future<Output = ()>,
+{
+    let mut attempt = 0;
+    loop {
+        attempt += 1;
+        match probe().await {
+            Ok(()) => return Ok(attempt),
+            Err(e) if e.kind == ZomeErrorKind::CellNotRunning && attempt < w.attempts => {
+                log::info!("{} cells not ready yet (attempt {}/{}), waiting {} s", w.label, attempt, w.attempts, w.gap.as_secs());
+                tokio::time::sleep(w.gap).await;
+                for id in w.reenable {
+                    reenable(id.clone()).await;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
+impl AdminClient {
+    /// [`wait_ready_by`] with this line's re-enable: `probe` is the app's own
+    /// read-only call on the cell (a zome call on its interface).
+    pub async fn wait_ready_with<P, PF>(&self, w: &ReadyWait<'_>, probe: P) -> Result<u32, crate::client::ZomeCallError>
+    where
+        P: FnMut() -> PF,
+        PF: std::future::Future<Output = Result<(), crate::client::ZomeCallError>>,
+    {
+        wait_ready_by(w, probe, |id| async move {
+            let _ = self.enable(&id).await;
+        })
+        .await
+    }
+}
+
 /// What a recovery tries again.
 enum Retry<'r> {
     Install(&'r InstallRequest<'r>),
@@ -682,6 +730,56 @@ impl AdminClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn not_running() -> crate::client::ZomeCallError {
+        crate::client::ZomeCallError { fn_name: "read".into(), kind: ZomeErrorKind::CellNotRunning, detail: "CellNotRunning".into() }
+    }
+
+    #[tokio::test]
+    async fn a_read_probe_is_retried_while_the_cell_starts_and_nothing_else() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Mutex;
+        let apps = ["transcript_ai1".to_string()];
+        let w = ReadyWait { attempts: 5, gap: std::time::Duration::from_millis(1), reenable: &apps, label: "test" };
+
+        // Not running twice, then ready: three attempts, each gap re-enables.
+        let calls = AtomicU32::new(0);
+        let reenabled = Mutex::new(Vec::new());
+        let n = wait_ready_by(
+            &w,
+            || {
+                let n = calls.fetch_add(1, Ordering::SeqCst);
+                async move { if n < 2 { Err(not_running()) } else { Ok(()) } }
+            },
+            |id| {
+                reenabled.lock().unwrap().push(id);
+                async {}
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(n, 3);
+        assert_eq!(*reenabled.lock().unwrap(), ["transcript_ai1", "transcript_ai1"]);
+
+        // Never ready: gives up after the attempts, with the last error.
+        let e = wait_ready_by(&w, || async { Err(not_running()) }, |_| async {}).await.unwrap_err();
+        assert_eq!(e.kind, ZomeErrorKind::CellNotRunning);
+
+        // Any other error ends the wait at once.
+        let calls = AtomicU32::new(0);
+        let e = wait_ready_by(
+            &w,
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(crate::client::ZomeCallError { fn_name: "read".into(), kind: ZomeErrorKind::Unauthorized, detail: "no".into() }) }
+            },
+            |_| async {},
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.kind, ZomeErrorKind::Unauthorized);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn the_text_is_the_clients_display() {
