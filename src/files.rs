@@ -36,6 +36,29 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     std::fs::rename(&tmp, path)
 }
 
+/// [`write_atomic`] for a file only this OS account can read (Unix mode
+/// 0600, set as the temporary file is created).
+pub fn write_atomic_private(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut tmp_name = path.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    tmp_name.push(".tmp");
+    let tmp = path.with_file_name(tmp_name);
+    let _ = std::fs::remove_file(&tmp);
+    {
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut f = options.open(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
 /// The first `max_chars` characters of `text`, cut on a character boundary
 /// (slicing bytes panics inside a multibyte character, which a conductor's
 /// log can contain), with `...` when it was cut.
