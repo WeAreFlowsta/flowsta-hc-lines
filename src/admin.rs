@@ -564,6 +564,121 @@ impl AdminClient {
     }
 }
 
+/// What [`AdminClient::connect_app`] needs.
+pub struct AppConnect<'a> {
+    pub app_port: u16,
+    /// The origin the conductor's interfaces accept (the start's).
+    pub origin: &'a str,
+    pub app_id: &'a str,
+    /// The cell whose calls are signed ([`AdminClient::app_cell`]).
+    pub cell: &'a CellRef,
+    /// The cell's signing grant: one the app keeps
+    /// ([`AdminClient::authorize_signing`], or the one
+    /// [`AdminClient::wait_cell_ready`] handed back).
+    pub grant: Grant,
+    /// How long one call may take. The client's default is 60 s; a first
+    /// call that compiles wasm, or a long network read, needs more.
+    pub request_timeout: std::time::Duration,
+}
+
+fn not_found(op: &'static str, detail: String) -> AdminError {
+    AdminError { op, kind: ZomeErrorKind::Other, detail }
+}
+
+impl AdminClient {
+    /// The provisioned cell of `app_id` whose role name starts with
+    /// `role_prefix`.
+    pub async fn app_cell(&self, app_id: &str, role_prefix: &str) -> Result<CellRef, AdminError> {
+        let apps = self.list_apps().await?;
+        let app = apps
+            .iter()
+            .find(|a| a.app_id == app_id)
+            .ok_or_else(|| not_found("app_cell", format!("{app_id} is not installed on the {} line", self.line())))?;
+        app.cells
+            .iter()
+            .find(|c| c.role.starts_with(role_prefix))
+            .cloned()
+            .ok_or_else(|| not_found("app_cell", format!("no {role_prefix} cell in {app_id} ({})", self.line())))
+    }
+
+    /// One signing grant on `cell`. A grant is a write to the cell's chain:
+    /// keep it (for the session, or across sessions) rather than asking for
+    /// a new one on every connect.
+    pub async fn authorize_signing(&self, cell: &CellRef) -> Result<Grant, AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => {
+                use crate::v06::holochain_client::AuthorizeSigningCredentialsPayload;
+                use crate::v06::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let cell_id = CellId::new(DnaHash::from_raw_39(cell.dna_hash.clone()), AgentPubKey::from_raw_39(cell.agent_key.clone()));
+                ws.authorize_signing_credentials(AuthorizeSigningCredentialsPayload { cell_id, functions: None })
+                    .await
+                    .map(Grant::V06)
+                    .map_err(|e| err_06("authorize_signing_credentials", e))
+            }
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => {
+                use crate::v07::holochain_client::AuthorizeSigningCredentialsPayload;
+                use crate::v07::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let cell_id = CellId::new(DnaHash::from_raw_39(cell.dna_hash.clone()), AgentPubKey::from_raw_39(cell.agent_key.clone()));
+                ws.authorize_signing_credentials(AuthorizeSigningCredentialsPayload { cell_id, functions: None })
+                    .await
+                    .map(Grant::V07)
+                    .map_err(|e| err_07("authorize_signing_credentials", e))
+            }
+        }
+    }
+
+    /// Connect to an installed app's interface on this line: a token issued
+    /// here, calls signed with the app's grant for the cell. The grant must
+    /// be this line's.
+    pub async fn connect_app(&self, c: AppConnect<'_>) -> Result<crate::client::AppClient, AdminError> {
+        let url = format!("localhost:{}", c.app_port);
+        match (self, c.grant) {
+            #[cfg(feature = "line-06")]
+            (AdminClient::V06(ws), Grant::V06(credentials)) => {
+                use crate::v06::holochain_client::{AppWebsocket, ClientAgentSigner, IssueAppAuthenticationTokenPayload, WebsocketConfig};
+                use crate::v06::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let issued = ws
+                    .issue_app_auth_token(IssueAppAuthenticationTokenPayload::for_installed_app_id(c.app_id.to_string()))
+                    .await
+                    .map_err(|e| err_06("issue_app_auth_token", e))?;
+                let signer = ClientAgentSigner::default();
+                signer.add_credentials(CellId::new(DnaHash::from_raw_39(c.cell.dna_hash.clone()), AgentPubKey::from_raw_39(c.cell.agent_key.clone())), credentials);
+                let mut config = WebsocketConfig::CLIENT_DEFAULT;
+                config.default_request_timeout = c.request_timeout;
+                AppWebsocket::connect_with_config(url, std::sync::Arc::new(config), issued.token, signer.into(), Some(c.origin.to_string()))
+                    .await
+                    .map(crate::client::AppClient::V06)
+                    .map_err(|e| err_06("connect_app", e))
+            }
+            #[cfg(feature = "line-07")]
+            (AdminClient::V07(ws), Grant::V07(credentials)) => {
+                use crate::v07::holochain_client::{AppWebsocket, ClientAgentSigner, IssueAppAuthenticationTokenPayload, WebsocketConfig};
+                use crate::v07::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let issued = ws
+                    .issue_app_auth_token(IssueAppAuthenticationTokenPayload::for_installed_app_id(c.app_id.to_string()))
+                    .await
+                    .map_err(|e| err_07("issue_app_auth_token", e))?;
+                let signer = ClientAgentSigner::default();
+                signer.add_credentials(CellId::new(DnaHash::from_raw_39(c.cell.dna_hash.clone()), AgentPubKey::from_raw_39(c.cell.agent_key.clone())), credentials);
+                let mut config = WebsocketConfig::CLIENT_DEFAULT;
+                config.default_request_timeout = c.request_timeout;
+                AppWebsocket::connect_with_config(url, std::sync::Arc::new(config), issued.token, signer.into(), Some(c.origin.to_string()))
+                    .await
+                    .map(crate::client::AppClient::V07)
+                    .map_err(|e| err_07("connect_app", e))
+            }
+            #[allow(unreachable_patterns)]
+            _ => Err(AdminError {
+                op: "connect_app",
+                kind: ZomeErrorKind::Other,
+                detail: format!("the grant is for another line than {}", self.line()),
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
