@@ -1,6 +1,6 @@
 //! Lair key stores, one per line: start, wait, connect and seed import; the
-//! one-time copy of the previous line's store; the conductor's database key
-//! rewrap.
+//! one-time copy of the previous line's store; a store's passphrase and the
+//! conductor's database key, each rewrapped under a new passphrase.
 //!
 //! A conductor accepts only a lair of its own version, so each line runs its
 //! own key store. Both lines can hold the same agents in two ways:
@@ -20,6 +20,7 @@
 mod client;
 mod copy;
 mod dbkey;
+mod rewrap;
 
 #[cfg(feature = "line-06")]
 pub use client::v06;
@@ -27,6 +28,7 @@ pub use client::v06;
 pub use client::v07;
 pub use copy::{copy_store, CopiedStore, COPIED_FROM_FILE};
 pub use dbkey::{rekey_db_key, Rekeyed};
+pub use rewrap::rekey_store;
 
 use crate::files::log_excerpt;
 use crate::process::{SidecarChild, SidecarCommand};
@@ -75,6 +77,8 @@ pub enum KeyStoreError {
     SocketTooLong(PathBuf),
     #[error("key store config {}: {what}", .path.display())]
     Config { path: PathBuf, what: String },
+    #[error("the key store at {} doesn't open with the current passphrase", .0.display())]
+    StoreWrongPassphrase(PathBuf),
     #[error("the conductor's database key at {} doesn't open with the current password", .0.display())]
     DbKeyWrongPassword(PathBuf),
     #[error("the conductor's database key at {} is malformed: {what}", .path.display())]

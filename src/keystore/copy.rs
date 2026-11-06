@@ -114,7 +114,7 @@ fn remove_leftover_copies(parent: &Path, prefix: &str) {
 /// Whether the store's `pid_file` names a running lair. Lair leaves the file
 /// behind even on a clean stop, so a pid alone proves nothing: the process
 /// must be alive and be a lair.
-fn source_running(from: &Path) -> bool {
+pub(super) fn source_running(from: &Path) -> bool {
     let mut files = vec![from.join("pid_file")];
     if let Ok(p) = super::read_key(from, "pidFile") {
         let p = PathBuf::from(p);
