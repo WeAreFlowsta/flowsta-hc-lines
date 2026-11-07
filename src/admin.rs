@@ -678,7 +678,11 @@ impl AdminClient {
 
     /// One signing grant on `cell`. A grant is a write to the cell's chain:
     /// keep it (for the session, or across sessions) rather than asking for
-    /// a new one on every connect.
+    /// a new one on every connect, and ask for it one caller at a time per
+    /// cell. Two grants at once, or a grant beside another write on the
+    /// chain (the cell's first call runs its `init`), race for the chain's
+    /// head and one fails with "source chain head has moved"; the others
+    /// wait for the first and take its grant.
     pub async fn authorize_signing(&self, cell: &CellRef) -> Result<Grant, AdminError> {
         match self {
             #[cfg(feature = "line-06")]
