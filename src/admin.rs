@@ -551,6 +551,33 @@ impl AdminClient {
         }
     }
 
+    /// Disable an app: reversible, nothing deleted.
+    pub async fn disable(&self, app_id: &str) -> Result<(), AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => ws.disable_app(app_id.to_string()).await.map(|_| ()).map_err(|e| err_06("disable_app", e)),
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => ws.disable_app(app_id.to_string()).await.map(|_| ()).map_err(|e| err_07("disable_app", e)),
+        }
+    }
+
+    /// Uninstall an app of this line's own: one whose id starts with
+    /// `own_prefix`, the prefix the app gives that line's apps. Anything
+    /// else is refused before the conductor is asked, so a cleanup written
+    /// for one line can never remove another line's apps (or another
+    /// kind of app) by a loose match. Irreversible: the cell's data goes.
+    pub async fn uninstall(&self, app_id: &str, own_prefix: &str) -> Result<(), AdminError> {
+        if !owns(app_id, own_prefix) {
+            return Err(AdminError { op: "uninstall_app", kind: ZomeErrorKind::Other, detail: format!("{app_id} is not one of this line's apps ({own_prefix}*): not uninstalled") });
+        }
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => ws.uninstall_app(app_id.to_string(), false).await.map(|_| ()).map_err(|e| err_06("uninstall_app", e)),
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => ws.uninstall_app(app_id.to_string(), false).await.map(|_| ()).map_err(|e| err_07("uninstall_app", e)),
+        }
+    }
+
     /// Attach an app interface on a free port, answering `origin` only.
     pub async fn attach_app_interface(&self, origin: &str) -> Result<u16, AdminError> {
         match self {
@@ -724,6 +751,23 @@ impl AdminClient {
                 detail: format!("the grant is for another line than {}", self.line()),
             }),
         }
+    }
+}
+
+/// Whether `app_id` is one of the apps under `own_prefix` (never all apps:
+/// an empty prefix owns nothing).
+fn owns(app_id: &str, own_prefix: &str) -> bool {
+    !own_prefix.is_empty() && app_id.starts_with(own_prefix)
+}
+
+#[cfg(test)]
+mod uninstall_guard_tests {
+    #[test]
+    fn a_line_uninstalls_only_its_own_apps() {
+        assert!(super::owns("transcript_v2_local-1", "transcript_v2_"));
+        assert!(!super::owns("transcript_v1_local-1", "transcript_v2_"), "another line's app");
+        assert!(!super::owns("flowsta_private_v2_1", "transcript_v2_"), "another kind of app");
+        assert!(!super::owns("transcript_v2_local-1", ""), "an empty prefix owns nothing");
     }
 }
 
