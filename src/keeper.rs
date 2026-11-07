@@ -548,3 +548,132 @@ mod tests {
         assert!(Server::new("https://x.example", Some("not base64!")).is_none());
     }
 }
+
+/// The keeper against real 0.6.1 conductors whose own bootstrap is a black
+/// hole, with a local bootstrap server: it registers a stranded conductor's
+/// agents, registers nothing more once they are listed, and hands a second
+/// conductor the first one's notes.
+///
+/// `HC_LINES_CONDUCTOR_06=<holochain 0.6.1> HC_LINES_HAPP_06=<a .happ> KITSUNE2_BOOTSTRAP_SRV=<kitsune2-bootstrap-srv 0.4.1> cargo test --lib -- --ignored live_keeper --nocapture`
+#[cfg(all(test, feature = "line-06"))]
+mod live {
+    use super::*;
+    use crate::admin::{AdminClient, InstallRequest};
+    use crate::Line;
+    use std::io::Write;
+    use std::path::{Path, PathBuf};
+
+    const ORIGIN: &str = "hcl-keeper-live";
+
+    struct Proc(std::process::Child);
+    impl Drop for Proc {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn free_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn bin(var: &str) -> PathBuf {
+        PathBuf::from(std::env::var(var).unwrap_or_else(|_| panic!("set {var}")))
+    }
+
+    async fn conductor(dir: &Path, admin_port: u16, black_hole: u16, relay_port: u16) -> (Proc, AdminClient) {
+        std::fs::create_dir_all(dir.join("data")).unwrap();
+        std::fs::create_dir_all(dir.join("ks")).unwrap();
+        let config = dir.join("conductor-config.yaml");
+        std::fs::write(
+            &config,
+            format!(
+                "data_root_path: '{d}/data'\nkeystore:\n  type: lair_server_in_proc\n  lair_root: '{d}/ks'\nadmin_interfaces:\n- driver:\n    type: websocket\n    port: {admin_port}\n    allowed_origins: '*'\nnetwork:\n  bootstrap_url: http://127.0.0.1:{black_hole}\n  signal_url: ws://127.0.0.1:{black_hole}\n  relay_url: http://127.0.0.1:{relay_port}/\n  advanced:\n    irohTransport:\n      relayAllowPlainText: true\ndb_sync_strategy: Resilient\n",
+                d = dir.display(),
+            ),
+        )
+        .unwrap();
+        let mut child = std::process::Command::new(bin("HC_LINES_CONDUCTOR_06"))
+            .arg("--piped")
+            .arg("-c")
+            .arg(&config)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::fs::File::create(dir.join("holochain.log")).unwrap())
+            .stderr(std::fs::File::create(dir.join("holochain-stderr.log")).unwrap())
+            .spawn()
+            .expect("start the conductor");
+        child.stdin.take().unwrap().write_all(b"live-test\n").unwrap();
+        let proc_ = Proc(child);
+        for _ in 0..120 {
+            if let Ok(admin) = AdminClient::connect(Line::V06, admin_port, ORIGIN).await {
+                return (proc_, admin);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        panic!("{}: the admin interface never came up", dir.display());
+    }
+
+    /// `count` agents, each with the hApp under `seed`; their ids as notes name them.
+    async fn install(admin: &AdminClient, count: usize, seed: &str) -> Vec<String> {
+        let happ = bin("HC_LINES_HAPP_06");
+        let ws = admin.as_v06().expect("a 0.6 admin client");
+        let mut agents = Vec::new();
+        for i in 0..count {
+            let agent = ws.generate_agent_pub_key().await.unwrap();
+            let app_id = format!("keeper_live_{i}");
+            admin.install(&InstallRequest { app_id: &app_id, bundle: &happ, agent_key: agent.get_raw_39(), network_seed: Some(seed) }).await.unwrap();
+            admin.enable(&app_id).await.unwrap();
+            agents.push(id_core(agent.get_raw_39()));
+        }
+        agents
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_keeper_registers_a_stranded_conductor_and_feeds_peers_in() {
+        let tmp = tempfile::tempdir().unwrap();
+        let srv_port = free_port();
+        let black_hole = free_port();
+        let _srv = Proc(
+            std::process::Command::new(bin("KITSUNE2_BOOTSTRAP_SRV"))
+                .arg("--listen")
+                .arg(format!("127.0.0.1:{srv_port}"))
+                .stdout(std::fs::File::create(tmp.path().join("srv.log")).unwrap())
+                .stderr(std::fs::File::create(tmp.path().join("srv-stderr.log")).unwrap())
+                .spawn()
+                .expect("start the bootstrap server"),
+        );
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let url = format!("http://127.0.0.1:{srv_port}");
+        let seed = format!("keeper-live-{}", std::process::id());
+
+        let (_a, admin_a) = conductor(&tmp.path().join("a"), free_port(), black_hole, srv_port).await;
+        let a_agents = install(&admin_a, 2, &seed).await;
+        eprintln!("A up with {} agents, its own bootstrap a black hole", a_agents.len());
+        // Old enough that a conductor that could reach its server would have sent them.
+        tokio::time::sleep(std::time::Duration::from_secs(50)).await;
+
+        let mut keeper = Keeper::new(vec![Server::new(&url, None).unwrap()]);
+        let round = keeper.run_once(&admin_a, None).await.expect("a round for A");
+        eprintln!("A round: {round:?}");
+        assert_eq!((round.put, round.reached), (2, 1), "both of A's agents registered by the keeper");
+        let space = id_core(&admin_a.running_cells().await.unwrap()[0].dna_hash);
+        let listed = Server::new(&url, None).unwrap().list(&reqwest::Client::new(), &space).await.unwrap();
+        let listed_agents: HashSet<String> = listed.iter().map(|n| n.agent.clone()).collect();
+        assert_eq!(listed_agents, a_agents.iter().cloned().collect::<HashSet<_>>(), "the server lists exactly A's agents");
+        assert!(keeper.stalled_for().is_some(), "the keeper knows it is covering for the conductor");
+        let again = keeper.run_once(&admin_a, None).await.unwrap();
+        assert_eq!(again.put, 0, "nothing more once listed");
+
+        let (_b, admin_b) = conductor(&tmp.path().join("b"), free_port(), black_hole, srv_port).await;
+        install(&admin_b, 1, &seed).await;
+        let mut keeper_b = Keeper::new(vec![Server::new(&url, None).unwrap()]);
+        let round_b = keeper_b.run_once(&admin_b, None).await.expect("a round for B");
+        eprintln!("B round: {round_b:?}");
+        assert_eq!(round_b.added, 2, "B is handed A's two notes");
+        let b_knows: HashSet<String> = admin_b.agent_info().await.unwrap().iter().filter_map(|s| parse_note(s)).map(|n| n.agent).collect();
+        for agent in &a_agents {
+            assert!(b_knows.contains(agent), "B's conductor knows A's agent {agent}");
+        }
+    }
+}
