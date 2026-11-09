@@ -40,7 +40,7 @@ pub async fn rekey_store(store_dir: &Path, line: Line, current: &str, new: &str)
 
 macro_rules! rewrap_with {
     ($v:ident, $lair:ident) => {
-        mod $v {
+        pub(super) mod $v {
             use super::{config_path, Error, KeyStoreError, Rekeyed, Result};
             use std::io;
             use std::path::Path;
@@ -76,7 +76,7 @@ macro_rules! rewrap_with {
 
             /// The context key and the id seed, opened with `passphrase`;
             /// None when it is not this store's.
-            pub(super) async fn open(config: &LairServerConfigInner, passphrase: &str) -> io::Result<Option<(Key, Key)>> {
+            pub(in crate::keystore) async fn open(config: &LairServerConfigInner, passphrase: &str) -> io::Result<Option<(Key, Key)>> {
                 let salt = *config.runtime_secrets_salt.cloned_inner();
                 let (ctx_secret, id_secret) =
                     sealing_keys(passphrase, salt, config.runtime_secrets_ops_limit, config.runtime_secrets_mem_limit).await?;
@@ -87,7 +87,7 @@ macro_rules! rewrap_with {
                 Ok(Some((context_key, id_seed)))
             }
 
-            pub(super) fn read(store_dir: &Path) -> Result<LairServerConfigInner> {
+            pub(in crate::keystore) fn read(store_dir: &Path) -> Result<LairServerConfigInner> {
                 let path = config_path(store_dir);
                 let bytes = std::fs::read(&path).map_err(|source| Error::Io { what: "read the key store config", path: path.clone(), source })?;
                 LairServerConfigInner::from_bytes(&bytes).map_err(|e| KeyStoreError::Config { path, what: e.to_string() }.into())
@@ -127,7 +127,7 @@ macro_rules! rewrap_with {
             }
 
             #[cfg(test)]
-            pub(super) mod test_store {
+            pub(in crate::keystore) mod test_store {
                 use super::*;
                 use $lair::prelude::PwHashLimits;
 
