@@ -12,7 +12,12 @@
 //!
 //! **`list_entries` is never called.** A lair connection carries at most
 //! 8 KiB per message (0.6.3 and 0.7.1 alike), so listing a large store
-//! aborts the connection. Keys are looked up by tag.
+//! aborts the connection. Keys are looked up by tag. Holochain 0.7.1 itself
+//! lists every key at each app install with an existing agent key, so a
+//! 0.7 store past about forty keys cannot install at all: [`entries`] reads
+//! a stopped store through lair's own store code (no message limit) and
+//! says whether its listing fits, and [`keep_only`] rebuilds it with the
+//! keys a caller still uses.
 //!
 //! A connection URL carries the store's connection key (`?k=`). Nothing here
 //! logs it or puts it in an error.
@@ -20,6 +25,7 @@
 mod client;
 mod copy;
 mod dbkey;
+mod entries;
 mod rewrap;
 
 #[cfg(feature = "line-06")]
@@ -28,6 +34,7 @@ pub use client::v06;
 pub use client::v07;
 pub use copy::{copy_store, CopiedStore, COPIED_FROM_FILE};
 pub use dbkey::{rekey_db_key, Rekeyed};
+pub use entries::{entries, finish_interrupted, keep_only, Entry, EntryKind, Kept, Listing, LAIR_REPLY_MAX};
 pub use rewrap::rekey_store;
 
 use crate::files::log_excerpt;
