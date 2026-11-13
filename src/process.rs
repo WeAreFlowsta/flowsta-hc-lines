@@ -211,12 +211,117 @@ pub enum StopRequest {
     Terminate,
 }
 
+/// The argument an app's own executable takes to act as the interrupt
+/// helper ([`interrupt_helper_or_continue`]), followed by a process id.
+pub const INTERRUPT_HELPER_ARG: &str = "--hc-lines-interrupt";
+
+/// The program that runs the interrupt helper: the app's own executable
+/// once it has called [`interrupt_helper_or_continue`].
+static INTERRUPT_HELPER: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Call this first in `main`, before anything else runs.
+///
+/// Windows has no signal to ask another process to exit. What a console
+/// program does have is the Ctrl-C event of its console, and a conductor
+/// shuts down on it as it does on SIGINT. Each sidecar runs in a hidden
+/// console of its own, so the event must come from a process attached to
+/// THAT console: a short-lived copy of the app's own executable, started
+/// with [`INTERRUPT_HELPER_ARG`] and the sidecar's process id. It attaches
+/// to the sidecar's console, ignores the event itself, raises it and exits.
+/// (The app does not attach itself: a program has one console at a time,
+/// and the event reaches every process attached to it.)
+///
+/// Started that way, this function does that and never returns. Started
+/// normally, it notes that this executable can be the helper and returns:
+/// from then on [`stop_gracefully`] asks before it kills, on Windows too.
+/// An app that never calls it keeps the old Windows behavior (a kill).
+/// On other systems it does nothing.
+pub fn interrupt_helper_or_continue() {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() == Some(std::ffi::OsStr::new(INTERRUPT_HELPER_ARG)) {
+        let pid = args.next().and_then(|a| a.to_str().and_then(|s| s.parse::<u32>().ok()));
+        let code = match pid.map(interrupt_console_of) {
+            Some(Ok(())) => 0,
+            Some(Err(_)) => 1,
+            None => 2,
+        };
+        std::process::exit(code);
+    }
+    if cfg!(target_os = "windows") {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = INTERRUPT_HELPER.set(exe);
+        }
+    }
+}
+
+/// Name another program as the interrupt helper (one whose `main` calls
+/// [`interrupt_helper_or_continue`]): for a host that cannot take the
+/// argument itself, and for tests. The first name given stands.
+pub fn set_interrupt_helper(program: impl Into<PathBuf>) {
+    let _ = INTERRUPT_HELPER.set(program.into());
+}
+
+/// Raise Ctrl-C in the console of process `pid`, from this process: leave
+/// our own console (if any), attach to theirs, ignore the event ourselves,
+/// raise it for every process attached to that console, wait for it to be
+/// delivered, and leave. For the interrupt helper only: the calling process
+/// loses its own console for good.
+#[cfg(target_os = "windows")]
+pub fn interrupt_console_of(pid: u32) -> io::Result<()> {
+    use windows_sys::Win32::System::Console::{AttachConsole, FreeConsole, GenerateConsoleCtrlEvent, SetConsoleCtrlHandler, CTRL_C_EVENT};
+    // SAFETY: plain calls with no pointers but the null handler, which means
+    // "ignore Ctrl-C in this process".
+    unsafe {
+        FreeConsole();
+        if AttachConsole(pid) == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        SetConsoleCtrlHandler(None, 1);
+        let sent = GenerateConsoleCtrlEvent(CTRL_C_EVENT, 0) != 0;
+        let err = io::Error::last_os_error();
+        // The event is delivered on another thread of each attached process:
+        // stay attached (and ignoring it) until it has been.
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        FreeConsole();
+        if sent { Ok(()) } else { Err(err) }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+pub fn interrupt_console_of(_pid: u32) -> io::Result<()> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "a console control event is a Windows request; use a signal"))
+}
+
+/// Run the interrupt helper for `pid` and wait for it (it takes well under
+/// a second; five at most). True when it raised the event.
+#[cfg(target_os = "windows")]
+fn ask_by_console_event(helper: &std::path::Path, pid: u32) -> bool {
+    use std::os::windows::process::CommandExt as _;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    let mut cmd = std::process::Command::new(helper);
+    cmd.arg(INTERRUPT_HELPER_ARG).arg(pid.to_string()).stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).creation_flags(CREATE_NO_WINDOW);
+    let Ok(mut helper) = cmd.spawn() else { return false };
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        match helper.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if std::time::Instant::now() < until => std::thread::sleep(std::time::Duration::from_millis(25)),
+            _ => {
+                let _ = helper.kill();
+                let _ = helper.wait();
+                return false;
+            }
+        }
+    }
+}
+
 /// Stop a sidecar cleanly: ask it to exit (`request`), wait up to `grace`,
 /// then kill it, and reap it either way. A hard kill on every quit is what
 /// left lair's `pid_file` empty after a power cut, and what an updater must
-/// not do to a conductor in the middle of writing. Windows has no polite
-/// request yet (a console control event is still to be tested), so it
-/// kills as before.
+/// not do to a conductor in the middle of writing. On Windows the request
+/// is the Ctrl-C event of the sidecar's console, whichever `request` names,
+/// raised by the interrupt helper ([`interrupt_helper_or_continue`]); with
+/// no helper it kills, as it did before there was one.
 pub fn stop_gracefully(child: &mut SidecarChild, request: StopRequest, grace: std::time::Duration) -> io::Result<StopOutcome> {
     if child.try_wait()?.is_some() {
         return Ok(StopOutcome::AlreadyExited);
@@ -239,7 +344,22 @@ pub fn stop_gracefully(child: &mut SidecarChild, request: StopRequest, grace: st
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(target_os = "windows")]
+    {
+        let _ = request;
+        if let Some(helper) = INTERRUPT_HELPER.get() {
+            if ask_by_console_event(helper, child.id()) {
+                let until = std::time::Instant::now() + grace;
+                while std::time::Instant::now() < until {
+                    if child.try_wait()?.is_some() {
+                        return Ok(StopOutcome::Exited);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+        }
+    }
+    #[cfg(not(any(unix, target_os = "windows")))]
     let _ = (request, grace);
     if child.try_wait()?.is_some() {
         return Ok(StopOutcome::Exited);
@@ -1151,6 +1271,41 @@ mod tests {
         assert!(!path.is_empty(), "the rest of the environment is inherited");
         assert!(std::env::var_os("HCL_TEST_VAR").is_none(), "this process is left alone");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A console program that exits on Ctrl-C (and runs for a minute
+    /// otherwise), in a hidden console of its own as every sidecar is: asked
+    /// by the helper, it exits by itself and is not killed. The helper is
+    /// the `interrupt_helper` example, built with the tests.
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn on_windows_a_console_child_exits_on_the_helpers_request_and_is_not_killed() {
+        use super::*;
+        use std::time::{Duration, Instant};
+        let helper = std::env::current_exe().unwrap().parent().unwrap().parent().unwrap().join("examples").join("interrupt_helper.exe");
+        assert!(helper.exists(), "the interrupt_helper example is built with the tests: {}", helper.display());
+        set_interrupt_helper(&helper);
+        let ping = std::path::PathBuf::from(std::env::var_os("SystemRoot").unwrap()).join("System32").join("PING.EXE");
+        let spawn = || SidecarCommand::new(&ping).arg("-n").arg("60").arg("127.0.0.1").spawn().unwrap();
+
+        let mut c = spawn();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert!(pid_alive(c.id()));
+        let t = Instant::now();
+        assert_eq!(stop_gracefully(&mut c, StopRequest::Interrupt, Duration::from_secs(20)).unwrap(), StopOutcome::Exited, "asked, it left by itself");
+        assert!(t.elapsed() < Duration::from_secs(15), "well inside the grace: {:?}", t.elapsed());
+        assert!(!pid_alive(c.id()));
+
+        // The other request is the same event on Windows.
+        let mut c = spawn();
+        std::thread::sleep(Duration::from_millis(1500));
+        assert_eq!(stop_gracefully(&mut c, StopRequest::Terminate, Duration::from_secs(20)).unwrap(), StopOutcome::Exited);
+
+        // A helper that fails (no such process to attach to) costs nothing: the
+        // child that did not hear it is killed after the grace, as before.
+        assert!(!ask_by_console_event(&helper, 4_000_000_000), "no console to attach to");
+        // And this process, which asked, is still here with its own console.
+        assert!(pid_alive(std::process::id()));
     }
 
     /// The rules a Windows child's argv parser applies, so a config path
