@@ -440,8 +440,9 @@ pub fn quote_windows_arg(arg: &str) -> String {
 
 #[cfg(target_os = "windows")]
 mod win_spawn {
-    //! `CreateProcessW` with the console window created hidden
-    //! (`STARTF_USESHOWWINDOW` + `SW_HIDE`), stdin piped to us, stdout and
+    //! `CreateProcessW` with a console of the child's own, its window
+    //! created hidden (`CREATE_NEW_CONSOLE`, `STARTF_USESHOWWINDOW` +
+    //! `SW_HIDE`), stdin piped to us, stdout and
     //! stderr to inheritable file handles (or NUL). The child is assigned to
     //! the kill-on-close job right after creation.
     use super::SidecarCommand;
@@ -459,7 +460,7 @@ mod win_spawn {
     use windows_sys::Win32::System::Pipes::CreatePipe;
     use windows_sys::Win32::System::Threading::{
         CreateProcessW, GetCurrentProcess, GetExitCodeProcess, TerminateProcess,
-        WaitForSingleObject, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
+        WaitForSingleObject, CREATE_NEW_CONSOLE, CREATE_UNICODE_ENVIRONMENT, INFINITE, PROCESS_INFORMATION,
         STARTF_USESHOWWINDOW, STARTF_USESTDHANDLES, STARTUPINFOW,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::SW_HIDE;
@@ -671,9 +672,13 @@ mod win_spawn {
                 std::ptr::null(),
                 std::ptr::null(),
                 1, // bInheritHandles: the three std handles above
-                // A normal console, created hidden via si; a UTF-16 block
-                // when the environment is given.
-                if env_block.is_some() { CREATE_UNICODE_ENVIRONMENT } else { 0 },
+                // A console of its own, created hidden via si, whatever the
+                // parent has: a parent with a console (a debug build run
+                // from a terminal, a test) would otherwise share it with
+                // the child, and the Ctrl-C a stop raises in the child's
+                // console (`interrupt_console_of`) would reach the parent
+                // too. A UTF-16 block when the environment is given.
+                CREATE_NEW_CONSOLE | if env_block.is_some() { CREATE_UNICODE_ENVIRONMENT } else { 0 },
                 env_block.as_ref().map(|b| b.as_ptr() as *const std::ffi::c_void).unwrap_or(std::ptr::null()),
                 cwd_w.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null()),
                 &si,
