@@ -19,16 +19,22 @@ pub struct Rendezvous {
     /// Standard padded base64, for servers that gate on it. Sent to both the
     /// bootstrap and the relay.
     pub auth_material: Option<String>,
+    /// The relay, when another host than the bootstrap's serves it
+    /// (`https://relay.example.com./`). None: the bootstrap's own host.
+    pub relay_url: Option<String>,
 }
 
 impl Rendezvous {
     pub fn new(bootstrap_url: impl Into<String>) -> Self {
-        Self { bootstrap_url: bootstrap_url.into(), signal_url: None, auth_material: None }
+        Self { bootstrap_url: bootstrap_url.into(), signal_url: None, auth_material: None, relay_url: None }
     }
 
-    /// The relay URL, served by the bootstrap's host ([`relay_url_for`]).
+    /// The relay URL: as given, else the bootstrap's host ([`relay_url_for`]).
     pub fn relay_url(&self) -> String {
-        relay_url_for(&self.bootstrap_url)
+        match self.relay_url.as_deref().filter(|r| !r.is_empty()) {
+            Some(r) => r.to_string(),
+            None => relay_url_for(&self.bootstrap_url),
+        }
     }
 
     /// The 0.6 signal URL: as given, else `wss://` on the bootstrap's host.
@@ -106,6 +112,16 @@ pub fn relay_url_for(bootstrap_url: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_relay_of_its_own_is_used_as_given_and_none_means_the_bootstraps_host() {
+        use super::*;
+        assert_eq!(Rendezvous::new("https://b.example.com").relay_url(), "https://b.example.com./");
+        let other = Rendezvous { relay_url: Some("https://relay.example.net./".into()), ..Rendezvous::new("https://b.example.com") };
+        assert_eq!(other.relay_url(), "https://relay.example.net./");
+        let empty = Rendezvous { relay_url: Some(String::new()), ..Rendezvous::new("https://b.example.com") };
+        assert_eq!(empty.relay_url(), "https://b.example.com./");
+    }
+
     use super::*;
 
     #[test]

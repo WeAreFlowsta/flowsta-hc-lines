@@ -19,6 +19,7 @@
 
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// One signed agent note as the admin port and the server both carry it:
 /// the raw string is what gets PUT and what `add_agent_info` takes.
@@ -29,6 +30,9 @@ pub(crate) struct Note {
     /// Microseconds since the epoch.
     pub created_at: i64,
     pub tombstone: bool,
+    /// The address the note says the agent is reached at; None while it
+    /// has none.
+    pub url: Option<String>,
     pub raw: String,
 }
 
@@ -47,6 +51,7 @@ pub(crate) fn parse_note(raw: &str) -> Option<Note> {
         agent: inner.get("agent")?.as_str()?.to_string(),
         created_at,
         tombstone: inner.get("isTombstone").and_then(|v| v.as_bool()).unwrap_or(false),
+        url: inner.get("url").and_then(|v| v.as_str()).filter(|u| !u.is_empty()).map(str::to_string),
         raw: raw.to_string(),
     })
 }
@@ -108,6 +113,32 @@ pub(crate) fn notes_to_add<'a>(listed: &'a [Note], own_agents: &HashSet<String>,
         .filter(|l| !own_agents.contains(&l.agent))
         .filter(|l| !known.iter().any(|k| k.space == l.space && k.agent == l.agent && k.created_at >= l.created_at))
         .collect()
+}
+
+/// How long after the last note signed elsewhere another install still
+/// counts as running: two of a note's 20-minute lives, since two installs
+/// that sign close together show each other a newer note only briefly.
+const ELSEWHERE_LAPSES_AFTER: Duration = Duration::from_secs(40 * 60);
+
+/// Our own agents that a server lists at ANOTHER address, in a note signed
+/// after ours: `(space, agent, when that note was signed)`. One conductor
+/// signs each of its agents' notes, so a newer note for our agent naming
+/// another address was signed by another conductor holding the same key:
+/// a second install running as it. (Our own notes from an earlier run or an
+/// earlier address are older than our current one, and never count.) Two
+/// conductors under one key each keep their own chain, and neither's
+/// records reach the other.
+pub(crate) fn announced_elsewhere(own: &[Note], listed: &[Note]) -> Vec<(String, String, i64)> {
+    let mut out = Vec::new();
+    for mine in own.iter().filter(|n| !n.tombstone) {
+        let Some(my_url) = mine.url.as_deref() else { continue };
+        for other in listed.iter().filter(|l| l.space == mine.space && l.agent == mine.agent && !l.tombstone) {
+            if other.created_at > mine.created_at && other.url.as_deref().is_some_and(|u| u != my_url) {
+                out.push((other.space.clone(), other.agent.clone(), other.created_at));
+            }
+        }
+    }
+    out
 }
 
 /// The newest note per (space, agent) out of several servers' listings.
@@ -247,6 +278,10 @@ pub struct Round {
     /// Our notes we registered on a rendezvous the conductor was not
     /// configured with (an open fallback): extra reach, never a stall.
     pub put_elsewhere: usize,
+    /// Our agents another install is running as too, by now beyond doubt
+    /// ([`Keeper::same_key_elsewhere`]); 0 for every install with a key of
+    /// its own.
+    pub same_key_elsewhere: usize,
 }
 
 /// Is this the rendezvous the conductor itself registers with? The one it
@@ -269,6 +304,13 @@ pub struct Keeper {
     every_server_dark: bool,
     /// Fallback servers we have said we register on, said once each.
     told_elsewhere: HashSet<String>,
+    /// Notes for our own agents signed elsewhere: (space, agent) → the
+    /// signing times seen, and when one was last listed. Two different
+    /// times mean the other conductor signed twice: it is running, not a
+    /// leftover. Not listed for [`ELSEWHERE_LAPSES_AFTER`], it has stopped
+    /// or has a key of its own now.
+    elsewhere: HashMap<(String, String), (HashSet<i64>, Instant)>,
+    told_same_key: bool,
 }
 
 impl Keeper {
@@ -277,12 +319,22 @@ impl Keeper {
             .timeout(std::time::Duration::from_secs(15))
             .build()
             .unwrap_or_default();
-        Self { servers, client, registered: HashSet::new(), stalled_since: None, every_server_dark: false, told_elsewhere: HashSet::new() }
+        Self { servers, client, registered: HashSet::new(), stalled_since: None, every_server_dark: false, told_elsewhere: HashSet::new(), elsewhere: HashMap::new(), told_same_key: false }
     }
 
     /// How many servers this keeper asks.
     pub fn server_count(&self) -> usize {
         self.servers.len()
+    }
+
+    /// How many of this conductor's agents another install is running as
+    /// too: a rendezvous has listed the agent at another address in two
+    /// notes signed after ours, so the other conductor is alive and signing.
+    /// Zero for an install with a key of its own. While it is not zero, the
+    /// two installs cannot sync: an app should say so and offer the person
+    /// a way to give one of them a key of its own.
+    pub fn same_key_elsewhere(&self) -> usize {
+        self.elsewhere.values().filter(|(times, seen)| times.len() >= 2 && seen.elapsed() < ELSEWHERE_LAPSES_AFTER).count()
     }
 
     /// How long the keeper has been registering for the conductor, whose own
@@ -329,6 +381,11 @@ impl Keeper {
                     .filter(|n| now_us - n.created_at <= PUT_MAX_AGE_US)
                     .filter(|n| listed.iter().any(|l| l.agent == n.agent && l.created_at >= n.created_at))
                     .count() };
+                for (space, agent, signed_at) in announced_elsewhere(&own_here, &listed) {
+                    let seen = self.elsewhere.entry((space, agent)).or_insert_with(|| (HashSet::new(), Instant::now()));
+                    seen.0.insert(signed_at);
+                    seen.1 = Instant::now();
+                }
                 let full = listing_full(listed.len());
                 for note in notes_to_put(&own_here, &listed, now_us) {
                     if !first_time(&mut self.registered, note) {
@@ -351,6 +408,19 @@ impl Keeper {
             }
         }
         round.reached = reached.len();
+        self.elsewhere.retain(|_, (_, seen)| seen.elapsed() < ELSEWHERE_LAPSES_AFTER);
+        round.same_key_elsewhere = self.same_key_elsewhere();
+        if round.same_key_elsewhere == 0 && self.told_same_key {
+            self.told_same_key = false;
+            log::info!("[rendezvous] no other install has announced this conductor's key for {} min", ELSEWHERE_LAPSES_AFTER.as_secs() / 60);
+        }
+        if round.same_key_elsewhere > 0 && !self.told_same_key {
+            self.told_same_key = true;
+            log::warn!(
+                "[rendezvous] another install is running as this conductor's key ({} agent(s) listed at another address in notes signed after ours, twice): the two cannot sync until one has a key of its own",
+                round.same_key_elsewhere
+            );
+        }
 
         let to_add: Vec<String> = newest_per_agent(notes_to_add(&listings, &own_agents, &known)).into_iter().map(|n| n.raw.clone()).collect();
         if !to_add.is_empty() {
@@ -453,6 +523,49 @@ mod tests {
         let inner = serde_json::json!({ "agent": agent, "space": space, "createdAt": created_at.to_string(), "expiresAt": (created_at + 1_200_000_000).to_string(), "isTombstone": tombstone, "url": "http://relay/node", "storageArc": null });
         let raw = serde_json::json!({ "agentInfo": inner.to_string(), "signature": "c2ln" }).to_string();
         parse_note(&raw).expect("a note we made parses")
+    }
+
+    fn note_at(space: &str, agent: &str, created_at: i64, url: Option<&str>) -> Note {
+        let mut n = note(space, agent, created_at, false);
+        n.url = url.map(String::from);
+        n
+    }
+
+    #[test]
+    fn our_key_at_another_address_in_a_newer_note_is_another_install() {
+        let mine = [note_at("s", "me", 1_000, Some("http://relay/here"))];
+        // Signed after ours, at another address: another conductor holds the key.
+        assert_eq!(announced_elsewhere(&mine, &[note_at("s", "me", 1_500, Some("http://relay/there"))]), vec![("s".to_string(), "me".to_string(), 1_500)]);
+        // Our own note from an earlier run or an earlier address is older than ours.
+        assert!(announced_elsewhere(&mine, &[note_at("s", "me", 900, Some("http://relay/before-the-restart"))]).is_empty());
+        // The same address (the server has our own note, or a newer one of ours).
+        assert!(announced_elsewhere(&mine, &[note_at("s", "me", 1_500, Some("http://relay/here"))]).is_empty());
+        // Another agent, another space, a note with no address, a tombstone.
+        assert!(announced_elsewhere(&mine, &[note_at("s", "other", 1_500, Some("http://relay/there")), note_at("t", "me", 1_500, Some("http://relay/there")), note_at("s", "me", 1_500, None)]).is_empty());
+        let mut gone = note_at("s", "me", 1_500, Some("http://relay/there"));
+        gone.tombstone = true;
+        assert!(announced_elsewhere(&mine, &[gone]).is_empty());
+        // While we have no address of our own, nothing can be compared.
+        assert!(announced_elsewhere(&[note_at("s", "me", 1_000, None)], &[note_at("s", "me", 1_500, Some("http://relay/there"))]).is_empty());
+    }
+
+    #[test]
+    fn another_install_is_called_only_once_it_has_signed_twice() {
+        let mut k = Keeper::new(Vec::new());
+        assert_eq!(k.same_key_elsewhere(), 0);
+        // One note elsewhere: could be a leftover that was listed late.
+        let key = ("s".to_string(), "me".to_string());
+        k.elsewhere.insert(key.clone(), (HashSet::from([1_500]), Instant::now()));
+        k.elsewhere.get_mut(&key).unwrap().0.insert(1_500);
+        assert_eq!(k.same_key_elsewhere(), 0, "the same note seen in two rounds is one note");
+        // It signed again: it is running.
+        k.elsewhere.get_mut(&key).unwrap().0.insert(900_001_500);
+        assert_eq!(k.same_key_elsewhere(), 1);
+        // Not listed for two note lives: it stopped, or has a key of its own now.
+        if let Some(long_ago) = Instant::now().checked_sub(ELSEWHERE_LAPSES_AFTER + Duration::from_secs(1)) {
+            k.elsewhere.get_mut(&key).unwrap().1 = long_ago;
+            assert_eq!(k.same_key_elsewhere(), 0);
+        }
     }
 
     #[test]
