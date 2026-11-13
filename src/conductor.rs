@@ -313,7 +313,7 @@ mod tests {
     use super::*;
 
     fn rendezvous() -> Rendezvous {
-        Rendezvous { bootstrap_url: "https://b.example.com".into(), signal_url: None, auth_material: Some("eyJmb28iOiJiYXIifQ==".into()) }
+        Rendezvous { auth_material: Some("eyJmb28iOiJiYXIifQ==".into()), ..Rendezvous::new("https://b.example.com") }
     }
 
     /// The exact bytes each line's conductor is given.
