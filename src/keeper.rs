@@ -19,6 +19,7 @@
 
 use base64::Engine;
 use std::collections::{HashMap, HashSet};
+use std::time::{Duration, Instant};
 
 /// One signed agent note as the admin port and the server both carry it:
 /// the raw string is what gets PUT and what `add_agent_info` takes.
@@ -113,6 +114,11 @@ pub(crate) fn notes_to_add<'a>(listed: &'a [Note], own_agents: &HashSet<String>,
         .filter(|l| !known.iter().any(|k| k.space == l.space && k.agent == l.agent && k.created_at >= l.created_at))
         .collect()
 }
+
+/// How long after the last note signed elsewhere another install still
+/// counts as running: two of a note's 20-minute lives, since two installs
+/// that sign close together show each other a newer note only briefly.
+const ELSEWHERE_LAPSES_AFTER: Duration = Duration::from_secs(40 * 60);
 
 /// Our own agents that a server lists at ANOTHER address, in a note signed
 /// after ours: `(space, agent, when that note was signed)`. One conductor
@@ -299,9 +305,11 @@ pub struct Keeper {
     /// Fallback servers we have said we register on, said once each.
     told_elsewhere: HashSet<String>,
     /// Notes for our own agents signed elsewhere: (space, agent) → the
-    /// signing times seen. Two different times mean the other conductor
-    /// signed twice: it is running, not a leftover.
-    elsewhere: HashMap<(String, String), HashSet<i64>>,
+    /// signing times seen, and when one was last listed. Two different
+    /// times mean the other conductor signed twice: it is running, not a
+    /// leftover. Not listed for [`ELSEWHERE_LAPSES_AFTER`], it has stopped
+    /// or has a key of its own now.
+    elsewhere: HashMap<(String, String), (HashSet<i64>, Instant)>,
     told_same_key: bool,
 }
 
@@ -326,7 +334,7 @@ impl Keeper {
     /// two installs cannot sync: an app should say so and offer the person
     /// a way to give one of them a key of its own.
     pub fn same_key_elsewhere(&self) -> usize {
-        self.elsewhere.values().filter(|times| times.len() >= 2).count()
+        self.elsewhere.values().filter(|(times, seen)| times.len() >= 2 && seen.elapsed() < ELSEWHERE_LAPSES_AFTER).count()
     }
 
     /// How long the keeper has been registering for the conductor, whose own
@@ -374,7 +382,9 @@ impl Keeper {
                     .filter(|n| listed.iter().any(|l| l.agent == n.agent && l.created_at >= n.created_at))
                     .count() };
                 for (space, agent, signed_at) in announced_elsewhere(&own_here, &listed) {
-                    self.elsewhere.entry((space, agent)).or_default().insert(signed_at);
+                    let seen = self.elsewhere.entry((space, agent)).or_insert_with(|| (HashSet::new(), Instant::now()));
+                    seen.0.insert(signed_at);
+                    seen.1 = Instant::now();
                 }
                 let full = listing_full(listed.len());
                 for note in notes_to_put(&own_here, &listed, now_us) {
@@ -398,7 +408,12 @@ impl Keeper {
             }
         }
         round.reached = reached.len();
+        self.elsewhere.retain(|_, (_, seen)| seen.elapsed() < ELSEWHERE_LAPSES_AFTER);
         round.same_key_elsewhere = self.same_key_elsewhere();
+        if round.same_key_elsewhere == 0 && self.told_same_key {
+            self.told_same_key = false;
+            log::info!("[rendezvous] no other install has announced this conductor's key for {} min", ELSEWHERE_LAPSES_AFTER.as_secs() / 60);
+        }
         if round.same_key_elsewhere > 0 && !self.told_same_key {
             self.told_same_key = true;
             log::warn!(
@@ -539,12 +554,18 @@ mod tests {
         let mut k = Keeper::new(Vec::new());
         assert_eq!(k.same_key_elsewhere(), 0);
         // One note elsewhere: could be a leftover that was listed late.
-        k.elsewhere.entry(("s".into(), "me".into())).or_default().insert(1_500);
-        k.elsewhere.entry(("s".into(), "me".into())).or_default().insert(1_500);
+        let key = ("s".to_string(), "me".to_string());
+        k.elsewhere.insert(key.clone(), (HashSet::from([1_500]), Instant::now()));
+        k.elsewhere.get_mut(&key).unwrap().0.insert(1_500);
         assert_eq!(k.same_key_elsewhere(), 0, "the same note seen in two rounds is one note");
         // It signed again: it is running.
-        k.elsewhere.entry(("s".into(), "me".into())).or_default().insert(900_001_500);
+        k.elsewhere.get_mut(&key).unwrap().0.insert(900_001_500);
         assert_eq!(k.same_key_elsewhere(), 1);
+        // Not listed for two note lives: it stopped, or has a key of its own now.
+        if let Some(long_ago) = Instant::now().checked_sub(ELSEWHERE_LAPSES_AFTER + Duration::from_secs(1)) {
+            k.elsewhere.get_mut(&key).unwrap().1 = long_ago;
+            assert_eq!(k.same_key_elsewhere(), 0);
+        }
     }
 
     #[test]
