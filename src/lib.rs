@@ -28,6 +28,7 @@ pub mod pass;
 pub mod policy;
 pub mod process;
 pub mod rendezvous;
+pub mod restore;
 pub mod supervisor;
 pub mod reap;
 pub mod watch;
@@ -37,7 +38,7 @@ mod line;
 mod record;
 mod versions;
 
-pub use admin::{AdminClient, AdminError, AppSummary, CellRef, CoordinatorZome, Grant, InstallRequest, ReadyWait, Recovery};
+pub use admin::{AdminClient, AdminError, AppSummary, CellRef, CoordinatorZome, Grant, InstallRequest, ReadyWait, Recovery, RestoreState};
 pub use client::{calling, in_flight, kind_of_message, AppClient, Calling, InstallFailure, ZomeCallError, ZomeErrorKind};
 pub use error::{Error, Result};
 pub use line::{needs_update, records_held, Line};
