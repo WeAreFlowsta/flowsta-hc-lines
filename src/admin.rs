@@ -53,6 +53,23 @@ impl From<AdminError> for String {
     }
 }
 
+/// Where an installed app stands on rebuilding its key's chain from the
+/// network.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreState {
+    NotInstalled,
+    /// The conductor is asking peers for the chain; it retries by itself (no
+    /// peer yet, too few that agree on the chain's head, a gap).
+    Restoring,
+    /// The chain is written and the app is not enabled yet (also: an app
+    /// that is installed and disabled for any other reason).
+    Restored,
+    Enabled,
+    /// The network holds a validated warrant against the key: its chain can
+    /// never be restored. The app must be uninstalled.
+    Unrecoverable(String),
+}
+
 /// One hApp bundle to install under `app_id` for `agent_key` (39 bytes).
 pub struct InstallRequest<'a> {
     pub app_id: &'a str,
@@ -332,6 +349,86 @@ impl AdminClient {
                 .await
                 .map(|_| ())
                 .map_err(|e| err_07("install_app", e))
+            }
+        }
+    }
+
+    /// Install one bundle for an agent key that already has a chain on the
+    /// network (a key brought to a new device): the conductor rebuilds that
+    /// chain from peers instead of starting a second one under the key, and
+    /// the app waits in [`RestoreState::Restoring`] until it has. See
+    /// [`crate::restore`]. The 0.7 line only: on 0.6 a second device of a
+    /// key starts its own chain and nothing is restored.
+    pub async fn install_restoring(&self, req: &InstallRequest<'_>) -> Result<(), AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(_) => Err(AdminError { op: "install_app", kind: ZomeErrorKind::Other, detail: "a chain is restored from the network on the 0.7 line only".into() }),
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => {
+                use crate::v07::holochain_client::InstallAppPayload;
+                use crate::v07::holochain_types::{app::AppBundleSource, prelude::AgentPubKey};
+                ws.install_app(InstallAppPayload {
+                    source: AppBundleSource::Path(req.bundle.to_path_buf()),
+                    agent_key: Some(AgentPubKey::from_raw_39(req.agent_key.to_vec())),
+                    installed_app_id: Some(req.app_id.to_string()),
+                    network_seed: req.network_seed.map(str::to_string),
+                    roles_settings: None,
+                    ignore_genesis_failure: false,
+                    restore_from_dht: true,
+                })
+                .await
+                .map(|_| ())
+                .map_err(|e| err_07("install_app", e))
+            }
+        }
+    }
+
+    /// Where an app stands on a restore ([`AdminClient::install_restoring`]).
+    pub async fn restore_state(&self, app_id: &str) -> Result<RestoreState, AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => {
+                use crate::v06::holochain_types::app::AppStatus;
+                let apps = ws.list_apps(None).await.map_err(|e| err_06("list_apps", e))?;
+                Ok(match apps.iter().find(|a| a.installed_app_id == app_id).map(|a| &a.status) {
+                    None => RestoreState::NotInstalled,
+                    Some(AppStatus::Enabled) => RestoreState::Enabled,
+                    Some(_) => RestoreState::Restored,
+                })
+            }
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => {
+                use crate::v07::holochain_types::app::AppStatus;
+                let apps = ws.list_apps(None).await.map_err(|e| err_07("list_apps", e))?;
+                Ok(match apps.iter().find(|a| a.installed_app_id == app_id).map(|a| &a.status) {
+                    None => RestoreState::NotInstalled,
+                    Some(AppStatus::Enabled) => RestoreState::Enabled,
+                    Some(AppStatus::AwaitingRestore) => RestoreState::Restoring,
+                    Some(AppStatus::Unrecoverable(_, reason)) => RestoreState::Unrecoverable(format!("{reason:?}")),
+                    Some(_) => RestoreState::Restored,
+                })
+            }
+        }
+    }
+
+    /// The highest action seq of a cell's chain as this conductor holds it;
+    /// `None` for a chain with nothing in it. Reads the cell's state, also
+    /// while its app is not enabled.
+    pub async fn chain_head(&self, cell: &CellRef) -> Result<Option<u32>, AdminError> {
+        match self {
+            #[cfg(feature = "line-06")]
+            AdminClient::V06(ws) => {
+                use crate::v06::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let cell_id = CellId::new(DnaHash::from_raw_39(cell.dna_hash.clone()), AgentPubKey::from_raw_39(cell.agent_key.clone()));
+                let dump = ws.dump_full_state(cell_id, None).await.map_err(|e| err_06("dump_full_state", e))?;
+                Ok(dump.source_chain_dump.records.iter().map(|r| r.action.action_seq()).max())
+            }
+            #[cfg(feature = "line-07")]
+            AdminClient::V07(ws) => {
+                use crate::v07::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+                let cell_id = CellId::new(DnaHash::from_raw_39(cell.dna_hash.clone()), AgentPubKey::from_raw_39(cell.agent_key.clone()));
+                let dump = ws.dump_full_state(cell_id, None, None).await.map_err(|e| err_07("dump_full_state", e))?;
+                Ok(dump.source_chain_dump.records.iter().map(|r| r.action.action_seq()).max())
             }
         }
     }
