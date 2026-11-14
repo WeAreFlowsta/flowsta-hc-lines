@@ -966,14 +966,14 @@ mod tests {
     /// writes one action each time), and the no-write probe tells a running
     /// cell from a stopped one.
     ///
-    /// `HC_LINES_LAIR_06= HC_LINES_LAIR_07= HC_LINES_CONDUCTOR_06= HC_LINES_CONDUCTOR_07= HC_LINES_HAPP_06= HC_LINES_HAPP_07= HC_LINES_HAPP_ROLE= HC_LINES_HAPP_ZOME= cargo test --lib -- --ignored live_calls_signed`
+    /// `HC_LINES_LAIR_06= HC_LINES_LAIR_07= HC_LINES_CONDUCTOR_06= HC_LINES_CONDUCTOR_07= HC_LINES_HAPP_06= HC_LINES_HAPP_07= HC_LINES_HAPP_ROLE= cargo test --lib -- --ignored live_calls_signed`
     #[tokio::test(flavor = "multi_thread")]
     #[ignore]
     async fn live_calls_signed_by_the_key_store_write_nothing() {
         use crate::admin::{AdminClient, AppConnect, InstallRequest, Signing};
         use crate::client::ZomeErrorKind;
         let var = |v: &str| std::env::var(v).unwrap_or_else(|_| panic!("set {v}"));
-        let (role, zome) = (var("HC_LINES_HAPP_ROLE"), var("HC_LINES_HAPP_ZOME"));
+        let role = var("HC_LINES_HAPP_ROLE");
         let tmp = tempfile::tempdir().unwrap();
         let root = tmp.path();
         let sockets = SocketPlan::new("hcl-signed", "lair");
@@ -1008,19 +1008,19 @@ mod tests {
             assert_eq!(admin.chain_head(&cell).await.unwrap(), Some(2), "{line}: a new chain holds its three first actions");
             // The first call of any kind runs the cell's init: one action.
             let first = connect().await;
-            first.cell_runs(&role, &zome).await.unwrap_or_else(|e| panic!("{line}: {e:?}"));
+            first.cell_runs(&role).await.unwrap_or_else(|e| panic!("{line}: {e:?}"));
             let head = admin.chain_head(&cell).await.unwrap();
             assert_eq!(head, Some(3), "{line}: init, and nothing else");
             for _ in 0..3 {
                 let again = connect().await;
-                again.cell_runs(&role, &zome).await.unwrap();
+                again.cell_runs(&role).await.unwrap();
                 assert_eq!(admin.chain_head(&cell).await.unwrap(), head, "{line}: another connection wrote nothing");
             }
             admin.disable("signed").await.unwrap();
-            let stopped = first.cell_runs(&role, &zome).await.expect_err("a stopped cell does not run");
+            let stopped = first.cell_runs(&role).await.expect_err("a stopped cell does not run");
             assert_eq!(stopped.kind, ZomeErrorKind::CellNotRunning, "{line}: {}", stopped.detail);
             admin.enable("signed").await.unwrap();
-            first.cell_runs(&role, &zome).await.unwrap();
+            first.cell_runs(&role).await.unwrap();
             assert_eq!(admin.chain_head(&cell).await.unwrap(), head, "{line}: the probe wrote nothing");
             // What it replaces: each grant is one write.
             let _grant = admin.authorize_signing(&cell).await.unwrap();

@@ -39,7 +39,7 @@ mod record;
 mod versions;
 
 pub use admin::{AdminClient, AdminError, AppSummary, CellRef, CoordinatorZome, Grant, InstallRequest, ReadyWait, Recovery, RestoreState, Signing};
-pub use client::{calling, in_flight, kind_of_message, AppClient, Calling, InstallFailure, ZomeCallError, ZomeErrorKind};
+pub use client::{calling, in_flight, kind_of_message, says_the_cell_runs, AppClient, Calling, InstallFailure, ZomeCallError, ZomeErrorKind, NO_SUCH_ZOME};
 pub use error::{Error, Result};
 pub use line::{needs_update, records_held, Line};
 pub use record::{record, record_opt, records, RecordView};
