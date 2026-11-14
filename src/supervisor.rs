@@ -559,6 +559,13 @@ impl Supervisor {
         agent_on(line, &url, passphrase, source).await
     }
 
+    /// The address of `line`'s key store while it runs, for
+    /// [`crate::admin::Signing::KeyStore`]. It carries the connection key:
+    /// never log it.
+    pub fn key_store_url(&self, line: Line) -> Option<String> {
+        self.current.lock().unwrap().lines[slot(line)].as_ref().map(|r| r.process.lair_url.clone())
+    }
+
     pub fn agent_key(&self) -> Option<[u8; 32]> {
         self.current.lock().unwrap().agent_key
     }

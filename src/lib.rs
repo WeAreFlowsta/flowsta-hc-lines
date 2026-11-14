@@ -38,7 +38,7 @@ mod line;
 mod record;
 mod versions;
 
-pub use admin::{AdminClient, AdminError, AppSummary, CellRef, CoordinatorZome, Grant, InstallRequest, ReadyWait, Recovery, RestoreState};
+pub use admin::{AdminClient, AdminError, AppSummary, CellRef, CoordinatorZome, Grant, InstallRequest, ReadyWait, Recovery, RestoreState, Signing};
 pub use client::{calling, in_flight, kind_of_message, AppClient, Calling, InstallFailure, ZomeCallError, ZomeErrorKind};
 pub use error::{Error, Result};
 pub use line::{needs_update, records_held, Line};
