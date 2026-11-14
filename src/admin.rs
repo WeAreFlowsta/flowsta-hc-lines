@@ -108,7 +108,9 @@ pub enum Grant {
     V07(crate::v07::holochain_client::SigningCredentials),
 }
 
-/// Wait until a 0.6 cell answers. The probe authorizes a signing grant on
+/// Wait until a 0.6 cell answers. Prefer [`AdminClient::wait_ready_with`]
+/// and [`crate::client::AppClient::cell_runs`], which write nothing. The
+/// probe here authorizes a signing grant on
 /// it (the one signal that the cells truly run; the listed status is not),
 /// retried while the conductor says the cell is not running. The grant
 /// is a chain write, so it is handed back for the caller to keep as the
@@ -736,6 +738,53 @@ impl AdminClient {
     }
 }
 
+/// What signs an app connection's calls.
+pub enum Signing<'a> {
+    /// The agent's own key, in the line's key store. A cell always takes
+    /// calls from its own agent, so nothing is written to the chain and no
+    /// secret is kept by the app: connect as often as needed. The key store
+    /// must be the one the conductor uses, unlocked.
+    KeyStore { url: &'a str, passphrase: &'a str },
+    /// A signing grant ([`AdminClient::authorize_signing`]). Each grant is
+    /// one write to the cell's chain, which then has to reach the network.
+    Grant(Grant),
+}
+
+/// A signer for `cells` that signs with each cell's own agent key in the
+/// 0.6 line's key store ([`Signing::KeyStore`]), for an app that opens its
+/// own `AppWebsocket`.
+#[cfg(feature = "line-06")]
+pub async fn key_store_signer_06(url: &str, passphrase: &str, cells: &[CellRef]) -> Result<std::sync::Arc<crate::v06::holochain_client::LairAgentSigner>, AdminError> {
+    use crate::v06::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+    let lair = crate::keystore::v06::connect(url, passphrase, KEY_STORE_CONNECT)
+        .await
+        .map_err(|e| AdminError { op: "key_store_signer", kind: ZomeErrorKind::Other, detail: e.to_string() })?;
+    let mut signer = crate::v06::holochain_client::LairAgentSigner::new(std::sync::Arc::new(lair));
+    for c in cells {
+        let agent = AgentPubKey::from_raw_39(c.agent_key.clone());
+        signer.add_credentials(CellId::new(DnaHash::from_raw_39(c.dna_hash.clone()), agent.clone()), agent);
+    }
+    Ok(std::sync::Arc::new(signer))
+}
+
+/// [`key_store_signer_06`] on the 0.7 line.
+#[cfg(feature = "line-07")]
+pub async fn key_store_signer_07(url: &str, passphrase: &str, cells: &[CellRef]) -> Result<std::sync::Arc<crate::v07::holochain_client::LairAgentSigner>, AdminError> {
+    use crate::v07::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
+    let lair = crate::keystore::v07::connect(url, passphrase, KEY_STORE_CONNECT)
+        .await
+        .map_err(|e| AdminError { op: "key_store_signer", kind: ZomeErrorKind::Other, detail: e.to_string() })?;
+    let mut signer = crate::v07::holochain_client::LairAgentSigner::new(std::sync::Arc::new(lair));
+    for c in cells {
+        let agent = AgentPubKey::from_raw_39(c.agent_key.clone());
+        signer.add_credentials(CellId::new(DnaHash::from_raw_39(c.dna_hash.clone()), agent.clone()), agent);
+    }
+    Ok(std::sync::Arc::new(signer))
+}
+
+/// How long a signer waits for the key store to take its connection.
+const KEY_STORE_CONNECT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What [`AdminClient::connect_app`] needs.
 pub struct AppConnect<'a> {
     pub app_port: u16,
@@ -744,10 +793,8 @@ pub struct AppConnect<'a> {
     pub app_id: &'a str,
     /// The cell whose calls are signed ([`AdminClient::app_cell`]).
     pub cell: &'a CellRef,
-    /// The cell's signing grant: one the app keeps
-    /// ([`AdminClient::authorize_signing`], or the one
-    /// [`AdminClient::wait_cell_ready`] handed back).
-    pub grant: Grant,
+    /// What signs the cell's calls.
+    pub signing: Signing<'a>,
     /// How long one call may take. The client's default is 60 s; a first
     /// call that compiles wasm, or a long network read, needs more.
     pub request_timeout: std::time::Duration,
@@ -773,7 +820,8 @@ impl AdminClient {
             .ok_or_else(|| not_found("app_cell", format!("no {role_prefix} cell in {app_id} ({})", self.line())))
     }
 
-    /// One signing grant on `cell`. A grant is a write to the cell's chain:
+    /// One signing grant on `cell`. Prefer [`Signing::KeyStore`], which
+    /// needs none. A grant is a write to the cell's chain:
     /// keep it (for the session, or across sessions) rather than asking for
     /// a new one on every connect, and ask for it one caller at a time per
     /// cell. Two grants at once, or a grant beside another write on the
@@ -806,13 +854,42 @@ impl AdminClient {
     }
 
     /// Connect to an installed app's interface on this line: a token issued
-    /// here, calls signed with the app's grant for the cell. The grant must
-    /// be this line's.
+    /// here, calls signed as `c.signing` says. A grant must be this line's.
     pub async fn connect_app(&self, c: AppConnect<'_>) -> Result<crate::client::AppClient, AdminError> {
         let url = format!("localhost:{}", c.app_port);
-        match (self, c.grant) {
+        match (self, c.signing) {
             #[cfg(feature = "line-06")]
-            (AdminClient::V06(ws), Grant::V06(credentials)) => {
+            (AdminClient::V06(ws), Signing::KeyStore { url: store, passphrase }) => {
+                use crate::v06::holochain_client::{AppWebsocket, IssueAppAuthenticationTokenPayload, WebsocketConfig};
+                let signer = key_store_signer_06(store, passphrase, std::slice::from_ref(c.cell)).await?;
+                let issued = ws
+                    .issue_app_auth_token(IssueAppAuthenticationTokenPayload::for_installed_app_id(c.app_id.to_string()))
+                    .await
+                    .map_err(|e| err_06("issue_app_auth_token", e))?;
+                let mut config = WebsocketConfig::CLIENT_DEFAULT;
+                config.default_request_timeout = c.request_timeout;
+                AppWebsocket::connect_with_config(url, std::sync::Arc::new(config), issued.token, signer, Some(c.origin.to_string()))
+                    .await
+                    .map(crate::client::AppClient::V06)
+                    .map_err(|e| err_06("connect_app", e))
+            }
+            #[cfg(feature = "line-07")]
+            (AdminClient::V07(ws), Signing::KeyStore { url: store, passphrase }) => {
+                use crate::v07::holochain_client::{AppWebsocket, IssueAppAuthenticationTokenPayload, WebsocketConfig};
+                let signer = key_store_signer_07(store, passphrase, std::slice::from_ref(c.cell)).await?;
+                let issued = ws
+                    .issue_app_auth_token(IssueAppAuthenticationTokenPayload::for_installed_app_id(c.app_id.to_string()))
+                    .await
+                    .map_err(|e| err_07("issue_app_auth_token", e))?;
+                let mut config = WebsocketConfig::CLIENT_DEFAULT;
+                config.default_request_timeout = c.request_timeout;
+                AppWebsocket::connect_with_config(url, std::sync::Arc::new(config), issued.token, signer, Some(c.origin.to_string()))
+                    .await
+                    .map(crate::client::AppClient::V07)
+                    .map_err(|e| err_07("connect_app", e))
+            }
+            #[cfg(feature = "line-06")]
+            (AdminClient::V06(ws), Signing::Grant(Grant::V06(credentials))) => {
                 use crate::v06::holochain_client::{AppWebsocket, ClientAgentSigner, IssueAppAuthenticationTokenPayload, WebsocketConfig};
                 use crate::v06::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
                 let issued = ws
@@ -829,7 +906,7 @@ impl AdminClient {
                     .map_err(|e| err_06("connect_app", e))
             }
             #[cfg(feature = "line-07")]
-            (AdminClient::V07(ws), Grant::V07(credentials)) => {
+            (AdminClient::V07(ws), Signing::Grant(Grant::V07(credentials))) => {
                 use crate::v07::holochain_client::{AppWebsocket, ClientAgentSigner, IssueAppAuthenticationTokenPayload, WebsocketConfig};
                 use crate::v07::holochain_types::prelude::{AgentPubKey, CellId, DnaHash};
                 let issued = ws

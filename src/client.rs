@@ -98,6 +98,20 @@ impl AppClient {
         }
     }
 
+    /// Whether `role`'s cell runs, asked without writing anything: a call
+    /// to a function `zome` does not have. A cell that runs answers that
+    /// the function is missing (Ok); one that does not answers
+    /// [`ZomeErrorKind::CellNotRunning`]. The probe for
+    /// [`crate::admin::AdminClient::wait_ready_with`]. A cell's first call
+    /// of any kind runs its `init`, this one included.
+    pub async fn cell_runs(&self, role: &str, zome: &str) -> Result<(), ZomeCallError> {
+        match self.call(role, zome, "__is_the_cell_running", vec![0xc0]).await {
+            Ok(_) => Ok(()),
+            Err(e) if e.kind == ZomeErrorKind::MissingFunction => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Call a zome function. `payload` is the msgpack of the input; the
     /// result is the msgpack of the output. Counted in flight on its line
     /// while it runs ([`calling`]).

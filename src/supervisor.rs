@@ -953,6 +953,76 @@ fn start_line_is_send(s: &'static LineStart<'static>) {
 mod tests {
     use super::*;
 
+    /// Calls signed with the agent's own key through the key store, on both
+    /// lines with the real binaries: the conductor takes them, connecting
+    /// any number of times writes nothing to the chain (a signing grant
+    /// writes one action each time), and the no-write probe tells a running
+    /// cell from a stopped one.
+    ///
+    /// `HC_LINES_LAIR_06= HC_LINES_LAIR_07= HC_LINES_CONDUCTOR_06= HC_LINES_CONDUCTOR_07= HC_LINES_HAPP_06= HC_LINES_HAPP_07= HC_LINES_HAPP_ROLE= HC_LINES_HAPP_ZOME= cargo test --lib -- --ignored live_calls_signed`
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore]
+    async fn live_calls_signed_by_the_key_store_write_nothing() {
+        use crate::admin::{AdminClient, AppConnect, InstallRequest, Signing};
+        use crate::client::ZomeErrorKind;
+        let var = |v: &str| std::env::var(v).unwrap_or_else(|_| panic!("set {v}"));
+        let (role, zome) = (var("HC_LINES_HAPP_ROLE"), var("HC_LINES_HAPP_ZOME"));
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let sockets = SocketPlan::new("hcl-signed", "lair");
+        let origin = conductor::fresh_origin("hcl");
+        let rendezvous = Rendezvous::new("https://127.0.0.1:9");
+        let agents = [KeySource::Seed { seed: [6u8; 32], tag: "device".into() }];
+        for (line, lair, cond, happ, lair_dir, cond_dir, ports) in [
+            (Line::V07, "HC_LINES_LAIR_07", "HC_LINES_CONDUCTOR_07", "HC_LINES_HAPP_07", "lair-07", "conductor-07", [47822u16, 47823]),
+            (Line::V06, "HC_LINES_LAIR_06", "HC_LINES_CONDUCTOR_06", "HC_LINES_HAPP_06", "lair", "conductor", [47820, 47821]),
+        ] {
+            let (lair_bin, cond_bin, happ) = (PathBuf::from(var(lair)), PathBuf::from(var(cond)), PathBuf::from(var(happ)));
+            let tuning = NetworkTuning::for_line(line);
+            let mut p = start_line(
+                &LineStart { line, lair_bin: &lair_bin, conductor_bin: &cond_bin, lair_dir: &root.join(lair_dir), conductor_dir: &root.join(cond_dir), passphrase: "live", sockets: &sockets, admin_ports: &ports, origin: &origin, rendezvous: &rendezvous, tuning: &tuning, agents: &agents, timeouts: Timeouts::default() },
+                |_| {},
+            )
+            .await
+            .unwrap_or_else(|e| panic!("{line}: {e}"));
+            let admin = AdminClient::connect(line, p.admin_port, &origin).await.unwrap();
+            // The 39-byte agent key: the 3-byte prefix, the key, its 4-byte location.
+            let agent_key = crate::v07::holochain_types::prelude::AgentPubKey::from_raw_32(p.agents[0].to_vec()).get_raw_39().to_vec();
+            admin.install(&InstallRequest { app_id: "signed", bundle: &happ, agent_key: &agent_key, network_seed: Some("signed") }).await.unwrap();
+            admin.enable("signed").await.unwrap();
+            let cell = admin.app_cell("signed", &role).await.unwrap();
+            let app_port = admin.attach_app_interface(&origin).await.unwrap();
+            let connect = || async {
+                admin
+                    .connect_app(AppConnect { app_port, origin: &origin, app_id: "signed", cell: &cell, signing: Signing::KeyStore { url: &p.lair_url, passphrase: "live" }, request_timeout: Duration::from_secs(120) })
+                    .await
+                    .unwrap_or_else(|e| panic!("{line}: {e:?}"))
+            };
+            assert_eq!(admin.chain_head(&cell).await.unwrap(), Some(2), "{line}: a new chain holds its three first actions");
+            // The first call of any kind runs the cell's init: one action.
+            let first = connect().await;
+            first.cell_runs(&role, &zome).await.unwrap_or_else(|e| panic!("{line}: {e:?}"));
+            let head = admin.chain_head(&cell).await.unwrap();
+            assert_eq!(head, Some(3), "{line}: init, and nothing else");
+            for _ in 0..3 {
+                let again = connect().await;
+                again.cell_runs(&role, &zome).await.unwrap();
+                assert_eq!(admin.chain_head(&cell).await.unwrap(), head, "{line}: another connection wrote nothing");
+            }
+            admin.disable("signed").await.unwrap();
+            let stopped = first.cell_runs(&role, &zome).await.expect_err("a stopped cell does not run");
+            assert_eq!(stopped.kind, ZomeErrorKind::CellNotRunning, "{line}: {}", stopped.detail);
+            admin.enable("signed").await.unwrap();
+            first.cell_runs(&role, &zome).await.unwrap();
+            assert_eq!(admin.chain_head(&cell).await.unwrap(), head, "{line}: the probe wrote nothing");
+            // What it replaces: each grant is one write.
+            let _grant = admin.authorize_signing(&cell).await.unwrap();
+            assert_eq!(admin.chain_head(&cell).await.unwrap(), head.map(|h| h + 1), "{line}: a grant is one chain write");
+            let report = p.stop();
+            assert!(matches!(report.conductor, Ok(StopOutcome::Exited)), "{line}: {:?}", report.conductor);
+        }
+    }
+
     /// Both lines with the real binaries, offline: one seed gives one key on
     /// both, each admin interface answers, the 0.7 config carries the gossip
     /// cap, both stop on request. A start that fails after its key store is
