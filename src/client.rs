@@ -98,6 +98,19 @@ impl AppClient {
         }
     }
 
+    /// Whether `role`'s cell runs, asked without writing anything and
+    /// without knowing what is in the cell: a call to a zome no cell has.
+    /// A cell that runs answers that the zome is not found (Ok); one that
+    /// does not answers [`ZomeErrorKind::CellNotRunning`]. The probe for
+    /// [`crate::admin::AdminClient::wait_ready_with`].
+    pub async fn cell_runs(&self, role: &str) -> Result<(), ZomeCallError> {
+        match self.call(role, NO_SUCH_ZOME, "is_the_cell_running", vec![0xc0]).await {
+            Ok(_) => Ok(()),
+            Err(e) if says_the_cell_runs(&e.detail) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+
     /// Call a zome function. `payload` is the msgpack of the input; the
     /// result is the msgpack of the output. Counted in flight on its line
     /// while it runs ([`calling`]).
@@ -273,6 +286,17 @@ pub(crate) fn kind_from_text(t: &str) -> ZomeErrorKind {
 /// themselves.
 pub fn kind_of_message(t: &str) -> ZomeErrorKind {
     kind_from_text(t)
+}
+
+/// The zome [`AppClient::cell_runs`] asks for: one no cell has.
+pub const NO_SUCH_ZOME: &str = "__no_such_zome";
+
+/// Whether a failed call to [`NO_SUCH_ZOME`] says the cell runs: both lines
+/// answer "Zome not found" from a running cell, and that the cell is
+/// disabled or not running from one that is not. For an app that makes the
+/// call on its own client.
+pub fn says_the_cell_runs(detail: &str) -> bool {
+    detail.contains("Zome not found")
 }
 
 /// What a failed `install_app` says about the app.
