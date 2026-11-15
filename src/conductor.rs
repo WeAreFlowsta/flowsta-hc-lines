@@ -239,46 +239,167 @@ enum AdminAnswer {
     Nothing,
 }
 
-/// Ask `port` for a WebSocket handshake carrying `origin`. A conductor takes
-/// only the origin in its config ([`fresh_origin`]), so a handshake taken is
-/// one with the conductor this start gave that origin.
-async fn admin_answer(port: u16, origin: &str) -> AdminAnswer {
+/// What one try at one loopback address met.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Probe {
+    /// A handshake carrying the origin was taken: this conductor.
+    Ours,
+    /// An HTTP answer that was not the handshake: another program, or a
+    /// conductor given another origin.
+    Another,
+    /// The connection was refused: nothing listens there.
+    Refused,
+    /// No connection within the wait.
+    NoConnection,
+    /// Connected, the request sent, and no reply within the wait: a listener
+    /// that has not come to this connection yet.
+    Silent,
+    /// Connected, then the other side closed or the connection failed.
+    HungUp,
+}
+
+/// How long one try waits to connect, and then for the reply.
+const PROBE_WAIT: Duration = Duration::from_secs(2);
+
+/// Ask `addr` for a WebSocket handshake carrying `origin`.
+async fn admin_probe(addr: std::net::SocketAddr, origin: &str) -> Probe {
     use base64::Engine;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    let within = Duration::from_secs(2);
-    let Ok(Ok(mut stream)) = tokio::time::timeout(within, tokio::net::TcpStream::connect(("127.0.0.1", port))).await else {
-        return AdminAnswer::Nothing;
+    let mut stream = match tokio::time::timeout(PROBE_WAIT, tokio::net::TcpStream::connect(addr)).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(_)) => return Probe::Refused,
+        Err(_) => return Probe::NoConnection,
     };
     let mut key = [0u8; 16];
     getrandom::getrandom(&mut key).expect("the system random source");
     let key = base64::engine::general_purpose::STANDARD.encode(key);
     let request = format!(
-        "GET / HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
+        "GET / HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\
          Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\nOrigin: {origin}\r\n\r\n"
     );
     if stream.write_all(request.as_bytes()).await.is_err() {
-        return AdminAnswer::Nothing;
+        return Probe::HungUp;
     }
     // "HTTP/1.1 101"
     let mut head = [0u8; 12];
-    match tokio::time::timeout(within, stream.read_exact(&mut head)).await {
-        Ok(Ok(_)) if head.starts_with(b"HTTP/") && &head[9..] == b"101" => AdminAnswer::Ours,
-        Ok(Ok(_)) if head.starts_with(b"HTTP/") => AdminAnswer::Another,
-        _ => AdminAnswer::Nothing,
+    match tokio::time::timeout(PROBE_WAIT, stream.read_exact(&mut head)).await {
+        Ok(Ok(_)) if head.starts_with(b"HTTP/") && &head[9..] == b"101" => Probe::Ours,
+        Ok(Ok(_)) if head.starts_with(b"HTTP/") => Probe::Another,
+        Ok(_) => Probe::HungUp,
+        Err(_) => Probe::Silent,
     }
 }
 
+/// The two loopback addresses of `port`. A conductor listens on both where
+/// the machine has both, and on the IPv6 one alone where its IPv4 bind is
+/// not available; its clients connect to `localhost`, which reaches either.
+fn loopbacks(port: u16) -> [std::net::SocketAddr; 2] {
+    [
+        (std::net::Ipv4Addr::LOCALHOST, port).into(),
+        (std::net::Ipv6Addr::LOCALHOST, port).into(),
+    ]
+}
+
+/// Ask `port` for a WebSocket handshake carrying `origin`, on the IPv4
+/// loopback and then the IPv6 one. A conductor takes only the origin in its
+/// config ([`fresh_origin`]), so a handshake taken is one with the conductor
+/// this start gave that origin.
+async fn admin_answer(port: u16, origin: &str) -> AdminAnswer {
+    answer_of(&admin_probes(port, origin).await)
+}
+
+async fn admin_probes(port: u16, origin: &str) -> Vec<Probe> {
+    let mut met = Vec::with_capacity(2);
+    for addr in loopbacks(port) {
+        let probe = admin_probe(addr, origin).await;
+        met.push(probe);
+        if probe == Probe::Ours {
+            break;
+        }
+    }
+    met
+}
+
+fn answer_of(met: &[Probe]) -> AdminAnswer {
+    if met.contains(&Probe::Ours) {
+        AdminAnswer::Ours
+    } else if met.contains(&Probe::Another) {
+        AdminAnswer::Another
+    } else {
+        AdminAnswer::Nothing
+    }
+}
+
+/// What the tries of one wait met, by address family, for the warning when
+/// the interface never answered: "refused 3, connected and no reply 11" reads
+/// very differently from "refused 14".
+#[derive(Default)]
+struct ProbeTally {
+    v4: [u32; 6],
+    v6: [u32; 6],
+}
+
+impl ProbeTally {
+    fn note(&mut self, met: &[Probe]) {
+        for (i, probe) in met.iter().enumerate() {
+            let counts = if i == 0 { &mut self.v4 } else { &mut self.v6 };
+            counts[*probe as usize] += 1;
+        }
+    }
+
+    fn family(counts: &[u32; 6]) -> String {
+        const NAMES: [&str; 6] = ["answered", "another program answered", "refused", "no connection", "connected and no reply", "connected then closed"];
+        let parts: Vec<String> = counts.iter().zip(NAMES).filter(|(n, _)| **n > 0).map(|(n, name)| format!("{name} {n}")).collect();
+        if parts.is_empty() { "not tried".into() } else { parts.join(", ") }
+    }
+
+    fn summary(&self) -> String {
+        format!("127.0.0.1: {}; [::1]: {}", Self::family(&self.v4), Self::family(&self.v6))
+    }
+}
+
+/// The conductor's own word that it finished starting: Holochain prints
+/// "Conductor ready." to its stdout once its interfaces are up.
+fn conductor_says_ready(conductor_dir: &Path) -> bool {
+    std::fs::read_to_string(conductor_dir.join("holochain-stdout.log")).map(|out| out.contains("Conductor ready.")).unwrap_or(false)
+}
+
+/// The longest a conductor that says it is ready is given to answer, counted
+/// from the start of the wait. Stopping one that is up and serving its
+/// network loses a working line (Windows, 2026-11-14: four starts of four).
+const READY_CONDUCTOR_WAIT: Duration = Duration::from_secs(90);
+
 /// Wait for this conductor's admin interface on `port`, watching the
 /// conductor: one that exits meanwhile fails at once with what it logged.
-/// The interface counts once it takes a handshake carrying `origin`. Two
-/// conductors starting together can pick the same free port, and the one
-/// that binds second never gets it: that start fails with
-/// [`ConductorError::PortTakenAtStart`], so it can try the next port.
+/// The interface counts once it takes a handshake carrying `origin`, on
+/// either loopback address. Two conductors starting together can pick the
+/// same free port, and the one that binds second never gets it: that start
+/// fails with [`ConductorError::PortTakenAtStart`], so it can try the next
+/// port. A conductor whose own log says it is ready is waited for past
+/// `timeout`, to [`READY_CONDUCTOR_WAIT`] in all. When the wait ends with no
+/// answer, the error says what each try met.
 pub async fn wait_admin(port: u16, origin: &str, timeout: Duration, child: &mut SidecarChild, conductor_dir: &Path) -> Result<()> {
-    let deadline = Instant::now() + timeout;
+    let started = Instant::now();
     let mut attempt = 0u32;
     let mut another = false;
-    while Instant::now() < deadline {
+    let mut tally = ProbeTally::default();
+    let mut waiting_on_ready = false;
+    loop {
+        let waited = started.elapsed();
+        if waited >= timeout {
+            let ready = !another && waited < READY_CONDUCTOR_WAIT.max(timeout) && conductor_says_ready(conductor_dir);
+            if !ready {
+                break;
+            }
+            if !waiting_on_ready {
+                waiting_on_ready = true;
+                log::warn!(
+                    "[conductor] no answer on admin port {port} after {}s, but the conductor's own log says it is ready: waiting on ({})",
+                    timeout.as_secs(),
+                    tally.summary()
+                );
+            }
+        }
         attempt += 1;
         match child.try_wait() {
             // Ours is gone, so whatever holds the port now is another's.
@@ -289,9 +410,12 @@ pub async fn wait_admin(port: u16, origin: &str, timeout: Duration, child: &mut 
             Ok(None) => {}
             Err(source) => return Err(Error::Io { what: "check the conductor process", path: conductor_dir.to_path_buf(), source }),
         }
-        match admin_answer(port, origin).await {
+        let met = admin_probes(port, origin).await;
+        tally.note(&met);
+        match answer_of(&met) {
             AdminAnswer::Ours => {
-                log::info!("[conductor] admin interface ready on port {port} (attempt {attempt})");
+                let on = if met.first() == Some(&Probe::Ours) { "" } else { " on the IPv6 loopback only" };
+                log::info!("[conductor] admin interface ready on port {port}{on} (attempt {attempt}, {} s)", started.elapsed().as_secs());
                 return Ok(());
             }
             AdminAnswer::Another if !another => {
@@ -305,7 +429,13 @@ pub async fn wait_admin(port: u16, origin: &str, timeout: Duration, child: &mut 
     if another {
         return Err(ConductorError::PortTakenAtStart { port, log_tail: read_logs(conductor_dir) }.into());
     }
-    Err(ConductorError::AdminNotReady { port, secs: timeout.as_secs(), log_tail: read_logs(conductor_dir) }.into())
+    let said_ready = if conductor_says_ready(conductor_dir) { "the conductor's own log says it is ready" } else { "the conductor's own log does not say it is ready" };
+    Err(ConductorError::AdminNotReady {
+        port,
+        secs: started.elapsed().as_secs(),
+        log_tail: format!("{attempt} tries ({}); {said_ready}; {}", tally.summary(), read_logs(conductor_dir)),
+    }
+    .into())
 }
 
 #[cfg(test)]
@@ -423,6 +553,96 @@ mod tests {
         assert_eq!(admin_answer(answering(SWITCHING), "o").await, AdminAnswer::Ours);
         assert_eq!(admin_answer(answering(REFUSED), "o").await, AdminAnswer::Another);
         assert_eq!(admin_answer(free, "o").await, AdminAnswer::Nothing);
+    }
+
+    /// A stand-in that takes connections and never answers them.
+    fn silent() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in listener.incoming().flatten() {
+                held.push(stream);
+            }
+        });
+        port
+    }
+
+    /// A stand-in for a conductor on the IPv6 loopback alone. None where the
+    /// machine has no IPv6 loopback.
+    fn answering_v6_only(reply: &'static str) -> Option<u16> {
+        let listener = std::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).ok()?;
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+        Some(port)
+    }
+
+    #[tokio::test]
+    async fn each_try_says_what_it_met() {
+        let v4 = |port: u16| std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, port));
+        let free = { std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port() };
+        assert_eq!(admin_probe(v4(answering(SWITCHING)), "o").await, Probe::Ours);
+        assert_eq!(admin_probe(v4(answering(REFUSED)), "o").await, Probe::Another);
+        assert_eq!(admin_probe(v4(free), "o").await, Probe::Refused);
+        assert_eq!(admin_probe(v4(silent()), "o").await, Probe::Silent);
+        let mut tally = ProbeTally::default();
+        tally.note(&[Probe::Refused, Probe::Refused]);
+        tally.note(&[Probe::Silent, Probe::Refused]);
+        tally.note(&[Probe::Silent, Probe::Ours]);
+        assert_eq!(tally.summary(), "127.0.0.1: refused 1, connected and no reply 2; [::1]: answered 1, refused 2");
+    }
+
+    /// A conductor that could bind only the IPv6 loopback is up: its clients
+    /// reach it through `localhost`.
+    #[tokio::test]
+    async fn a_conductor_on_the_ipv6_loopback_alone_counts() {
+        let Some(port) = answering_v6_only(SWITCHING) else { return };
+        assert_eq!(admin_answer(port, "o").await, AdminAnswer::Ours);
+    }
+
+    /// A conductor whose own log says it is ready is not given up on at the
+    /// usual wait; one that says nothing is, and the error says what the
+    /// tries met.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_conductor_that_says_it_is_ready_is_waited_for() {
+        let sh = |script: &str| SidecarCommand::new("/bin/sh").arg("-c").arg(script.to_string()).spawn().unwrap();
+        // Says nothing: the wait ends at its limit, naming the silence.
+        let dir = tempfile::tempdir().unwrap();
+        let mut child = sh("sleep 30");
+        let began = Instant::now();
+        let err = wait_admin(silent(), "o", Duration::from_secs(3), &mut child, dir.path()).await.unwrap_err();
+        assert!(began.elapsed() < Duration::from_secs(12), "gave up late: {:?}", began.elapsed());
+        let text = err.to_string();
+        assert!(matches!(err, Error::Conductor(ConductorError::AdminNotReady { .. })), "{text}");
+        assert!(text.contains("connected and no reply") && text.contains("does not say it is ready"), "{text}");
+        let _ = child.kill();
+        let _ = child.wait();
+        // Says it is ready and answers late: the wait goes on and finds it.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("holochain-stdout.log"), "###ADMIN_PORT:1###\nConductor ready.\n").unwrap();
+        let port = { std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port() };
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(6));
+            let listener = std::net::TcpListener::bind(("127.0.0.1", port)).unwrap();
+            use std::io::{Read, Write};
+            for mut stream in listener.incoming().flatten() {
+                let mut request = [0u8; 1024];
+                let _ = stream.read(&mut request);
+                let _ = stream.write_all(SWITCHING.as_bytes());
+            }
+        });
+        let mut child = sh("sleep 30");
+        wait_admin(port, "o", Duration::from_secs(2), &mut child, dir.path()).await.unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// A port another process answers on is not this conductor's, whether
