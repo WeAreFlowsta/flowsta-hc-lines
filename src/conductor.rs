@@ -249,7 +249,8 @@ enum Probe {
     Another,
     /// The connection was refused: nothing listens there.
     Refused,
-    /// No connection within the wait.
+    /// No connection within the wait. On Windows this is also what a port
+    /// nothing listens on looks like: the refusal comes later than the wait.
     NoConnection,
     /// Connected, the request sent, and no reply within the wait: a listener
     /// that has not come to this connection yet.
@@ -308,16 +309,13 @@ async fn admin_answer(port: u16, origin: &str) -> AdminAnswer {
     answer_of(&admin_probes(port, origin).await)
 }
 
+/// Both loopback addresses at once: on Windows a connection to a port
+/// nothing listens on is not refused at once, it runs out the wait, and one
+/// address after the other would halve the tries a start gets.
 async fn admin_probes(port: u16, origin: &str) -> Vec<Probe> {
-    let mut met = Vec::with_capacity(2);
-    for addr in loopbacks(port) {
-        let probe = admin_probe(addr, origin).await;
-        met.push(probe);
-        if probe == Probe::Ours {
-            break;
-        }
-    }
-    met
+    let [v4, v6] = loopbacks(port);
+    let (v4, v6) = tokio::join!(admin_probe(v4, origin), admin_probe(v6, origin));
+    vec![v4, v6]
 }
 
 fn answer_of(met: &[Probe]) -> AdminAnswer {
@@ -590,7 +588,8 @@ mod tests {
         let free = { std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap().local_addr().unwrap().port() };
         assert_eq!(admin_probe(v4(answering(SWITCHING)), "o").await, Probe::Ours);
         assert_eq!(admin_probe(v4(answering(REFUSED)), "o").await, Probe::Another);
-        assert_eq!(admin_probe(v4(free), "o").await, Probe::Refused);
+        let nothing = admin_probe(v4(free), "o").await;
+        assert!(matches!(nothing, Probe::Refused | Probe::NoConnection), "{nothing:?}");
         assert_eq!(admin_probe(v4(silent()), "o").await, Probe::Silent);
         let mut tally = ProbeTally::default();
         tally.note(&[Probe::Refused, Probe::Refused]);
