@@ -1,6 +1,8 @@
 # flowsta-hc-lines
 
-Run two Holochain lines side by side in a desktop app, and move a person's data from the old line to the new one.
+Run Holochain inside a desktop app: start a conductor and key store, keep them running, stop them cleanly, and, when Holochain moves on, run two lines side by side and move a person's data from the old line to the new one.
+
+How-tos: [docs.flowsta.com/sdk/hc-lines](https://docs.flowsta.com/sdk/hc-lines).
 
 A Holochain *line* is a series of releases that share a network and data format: 0.6.x is one line, 0.7.x the next. Moving between lines is a breaking change. Your app's conductor and key store change version, your DNAs get new hashes and therefore new networks, and a person's own data sits in a cell the new conductor cannot open. This library holds the pieces an app needs to get through that without putting anyone's data at risk:
 
@@ -12,7 +14,16 @@ A Holochain *line* is a series of releases that share a network and data format:
 
 ## Status
 
-**Before 1.0.** This machinery moved [Flowsta Vault](https://flowsta.com/vault)'s users from Holochain 0.6.1 to 0.7.1 in Vault 1.7.0. Since Vault 1.8.0 (in beta), the Vault runs both its lines on this library, and [ProofPoll](https://github.com/WeAreFlowsta/ProofPoll) 0.6.0 (in beta) uses its kit cache. The public interface still changes; expect breaking changes until 1.0, which comes once Flowsta's apps have shipped stable releases built on it.
+**Before 1.0.** This machinery moved [Flowsta Vault](https://flowsta.com/vault)'s users from Holochain 0.6.1 to 0.7.1 in Vault 1.7.0. Since Vault 1.8.0 (in beta), the Vault runs both its lines on this library, and [ProofPoll](https://github.com/WeAreFlowsta/ProofPoll) 0.6.0 (in beta) runs its conductors on it. The public interface still changes; expect breaking changes until 1.0, which comes once Flowsta's apps have shipped stable releases built on it.
+
+## Install
+
+```toml
+[dependencies]
+flowsta-hc-lines = { git = "https://github.com/WeAreFlowsta/flowsta-hc-lines", rev = "<commit>", default-features = false, features = ["line-07"] }
+```
+
+A new app needs `line-07` only. Both lines are on by default, for apps that already have people on 0.6.
 
 ## Lines are features
 
