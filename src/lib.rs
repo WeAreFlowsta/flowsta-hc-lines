@@ -27,6 +27,7 @@ pub mod marker;
 pub mod pass;
 pub mod policy;
 pub mod process;
+pub mod sidecar_watcher;
 pub mod rendezvous;
 pub mod restore;
 pub mod supervisor;

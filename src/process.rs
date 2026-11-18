@@ -9,8 +9,10 @@
 //! Linux: `prctl(PR_SET_PDEATHSIG, SIGTERM)`.
 //! Windows: a kill-on-close Job Object (the app owns the only handle), and
 //! the console window is CREATED hidden - see below.
-//! macOS: no-op for now. Clean exits work via `RunEvent::Exit`; abnormal
-//! terminations can still leak children. kqueue remains TODO.
+//! macOS: a watcher process beside each sidecar, the app's own program in
+//! a watch mode, which stops the sidecar when the app is gone
+//! (`sidecar_watcher`). On for an app whose `main` begins with
+//! `sidecar_watcher::run_as_sidecar_watcher_if_asked()`.
 //!
 //! ## Windows: why a raw `CreateProcessW` with `SW_HIDE`
 //!
@@ -49,7 +51,8 @@ use std::process::Command;
 pub trait CommandExt {
     /// Configure the child to be managed as a sidecar:
     /// - Linux: kernel sends `SIGTERM` when the parent dies.
-    /// - Windows / macOS: no-op (Windows uses the job object at spawn).
+    /// - Windows / macOS: no-op here (Windows uses the job object at spawn,
+    ///   macOS a watcher process started after it: `sidecar_watcher`).
     fn tie_to_parent(&mut self) -> &mut Self;
 }
 
@@ -149,7 +152,11 @@ impl SidecarCommand {
         if let Some(d) = &self.cwd {
             cmd.current_dir(d);
         }
-        cmd.tie_to_parent().spawn()
+        let child = cmd.tie_to_parent().spawn()?;
+        // macOS: nothing ends a child with its parent, so a watcher does
+        // (a no-op elsewhere, and for a program that has not turned it on).
+        crate::sidecar_watcher::watch_over(child.id());
+        Ok(child)
     }
 
     #[cfg(target_os = "windows")]
