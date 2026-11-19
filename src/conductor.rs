@@ -43,6 +43,14 @@ pub struct NetworkTuning {
     pub request_timeout_s: Option<u32>,
     /// The 0.7 gossip cap ([`GOSSIP_OP_BYTES_07`] by default). Ignored on 0.6.
     pub gossip_max_op_bytes: Option<u32>,
+    /// How long the 0.7 conductor waits to connect to one peer (kitsune2's
+    /// default is 60 s). A peer that is gone stays in every other peer's
+    /// list until its record expires, and gossip waits out the whole
+    /// connect on each try at it: a device added back by its phrase left
+    /// its earlier self behind, and the device it was syncing with spent a
+    /// minute at a time on that address while the new one's rounds timed
+    /// out. Ignored on 0.6.
+    pub connect_timeout_s: Option<u32>,
     /// The 0.7 `db_sync_level` (`Normal`, `Full`, `Off`). Ignored on 0.6.
     pub db_sync_level: Option<String>,
     /// The 0.6 `db_sync_strategy` (`Fast`, `Resilient`): how SQLite syncs
@@ -61,6 +69,7 @@ impl NetworkTuning {
         Self {
             request_timeout_s: None,
             gossip_max_op_bytes: (line == Line::V07).then_some(GOSSIP_OP_BYTES_07),
+            connect_timeout_s: None,
             db_sync_level: None,
             db_sync_strategy: None,
             rust_log: Some("warn".into()),
@@ -116,8 +125,15 @@ pub fn config_yaml(input: &ConfigInput) -> String {
         }
     }
     if input.line == Line::V07 {
-        if let Some(b) = input.tuning.gossip_max_op_bytes {
-            y.push_str(&format!("  advanced:\n    k2Gossip:\n      maxGossipOpBytes: {b}\n      maxRequestGossipOpBytes: {b}\n"));
+        let (cap, connect) = (input.tuning.gossip_max_op_bytes, input.tuning.connect_timeout_s);
+        if cap.is_some() || connect.is_some() {
+            y.push_str("  advanced:\n");
+        }
+        if let Some(b) = cap {
+            y.push_str(&format!("    k2Gossip:\n      maxGossipOpBytes: {b}\n      maxRequestGossipOpBytes: {b}\n"));
+        }
+        if let Some(t) = connect {
+            y.push_str(&format!("    irohTransport:\n      connectTimeoutS: {t}\n"));
         }
         if let Some(level) = &input.tuning.db_sync_level {
             y.push_str(&format!("db_sync_level: {level}\n"));
@@ -473,6 +489,27 @@ mod tests {
              \x20 request_timeout_s: 240\n  advanced:\n    k2Gossip:\n      maxGossipOpBytes: 1048576\n      maxRequestGossipOpBytes: 1048576\n\
              db_sync_level: Normal\n"
         );
+    }
+
+    #[test]
+    fn the_connect_timeout_is_written_beside_the_gossip_cap_or_alone() {
+        let r = Rendezvous::new("https://open.example.com");
+        let dir = Path::new("/d");
+        let yaml = |t: &NetworkTuning| config_yaml(&ConfigInput { line: Line::V07, conductor_dir: dir, lair_url: "unix:///l", admin_port: 1, origin: "o", rendezvous: &r, tuning: t });
+        let mut both = NetworkTuning::for_line(Line::V07);
+        both.connect_timeout_s = Some(15);
+        assert!(yaml(&both).contains("  advanced:\n    k2Gossip:\n      maxGossipOpBytes: 1048576\n      maxRequestGossipOpBytes: 1048576\n    irohTransport:\n      connectTimeoutS: 15\n"), "{}", yaml(&both));
+        let mut alone = both.clone();
+        alone.gossip_max_op_bytes = None;
+        assert!(yaml(&alone).contains("  advanced:\n    irohTransport:\n      connectTimeoutS: 15\n") && !yaml(&alone).contains("k2Gossip"), "{}", yaml(&alone));
+        assert_eq!(yaml(&alone).matches("advanced:").count(), 1);
+        // Neither: no `advanced` at all, as before.
+        alone.connect_timeout_s = None;
+        assert!(!yaml(&alone).contains("advanced"));
+        // The 0.6 line has no such setting.
+        let mut old = NetworkTuning::for_line(Line::V06);
+        old.connect_timeout_s = Some(15);
+        assert!(!config_yaml(&ConfigInput { line: Line::V06, conductor_dir: dir, lair_url: "unix:///l", admin_port: 1, origin: "o", rendezvous: &r, tuning: &old }).contains("connectTimeoutS"));
     }
 
     #[test]
